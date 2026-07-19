@@ -1,0 +1,37 @@
+{
+  "name": "huuid-emr-stub",
+  "version": "0.1.2",
+  "description": "HUUID EMR Stub Middleware -- Local clinic integration layer",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test-connection": "tsx scripts/test-connection.ts",
+    "download-keys": "tsx scripts/download-keys.ts",
+    "secure-keys": "tsx scripts/secure-keys.ts",
+    "generate-local-secret": "tsx scripts/generate-local-secret.ts",
+    "install-integrity-baseline": "tsx scripts/install-integrity-baseline.ts",
+    "check-permissions": "tsx scripts/check-permissions.ts",
+    "diagnostics": "tsx scripts/diagnostics.ts",
+    "install-service": "tsx scripts/install-service.ts",
+    "install-systemd": "tsx scripts/install-systemd.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "jose": "^6.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
