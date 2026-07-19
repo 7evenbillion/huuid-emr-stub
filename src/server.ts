@@ -4,9 +4,20 @@ import { loadConfig } from './config.js';
 import { localAuthMiddleware } from './local-auth.js';
 import { verifyPatient, type PurposeCode } from './verify-patient.js';
 import { getSystemStatus } from './status.js';
-import { listCacheEntries, cacheStats } from './cache.js';
+import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
 
 const config = loadConfig();
+
+// Open (and encrypt, if not already) the cache DB before accepting any
+// requests, so a missing facility private key is one clear message and a
+// clean exit -- not a crash on the first POST /verify (Step 4 / DoD item 8).
+try {
+  initializeCache();
+} catch (err) {
+  console.error(`Cache initialization failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+  process.exit(1);
+}
+
 const app = express();
 app.use(express.json());
 
@@ -18,7 +29,16 @@ const verifyBodySchema = z.object({
 // GET /health -- system status. Deliberately unauthenticated, matching the
 // resolver's own /api/health: monitoring shouldn't require a credential.
 app.get('/health', (_req: Request, res: Response) => {
-  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString(), ...getSystemStatus() });
+  const status = getSystemStatus();
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    ...status,
+    // Flat fields per this build step's Step 6, alongside the nested
+    // `cache` object above (which already carries the same information).
+    cache_encrypted: status.cache.encrypted,
+    cache_entries: status.cache.totalEntries,
+  });
 });
 
 // POST /verify -- the actual EMR-integration API surface. Requires
@@ -44,6 +64,7 @@ app.post('/verify', localAuthMiddleware, async (req: Request, res: Response) => 
 app.get('/debug/resolver', (_req: Request, res: Response) => {
   const entries = listCacheEntries(100);
   const stats = cacheStats();
+  const encryption = isDbFileEncrypted(stats.dbPath);
   const rows = entries
     .map(
       (e) => `<tr>
@@ -64,6 +85,7 @@ td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;font-size:0.85rem}</
 </head><body>
 <h1>HUUID EMR Stub -- Local Cache</h1>
 <p>Total entries: ${stats.totalEntries} | DB: ${escapeHtml(stats.dbPath)}</p>
+<p>Encryption: ${encryption.fileExists ? (encryption.encrypted ? 'ENCRYPTED (SQLCipher, AES-256-CBC + HMAC-SHA512)' : 'NOT ENCRYPTED') : 'no DB file yet'}</p>
 <table>
 <tr><th>Local Patient ID</th><th>HUUID</th><th>Blood Type</th><th>Allergies</th><th>Source</th><th>Verified At</th></tr>
 ${rows || '<tr><td colspan="6">No cache entries yet -- call POST /verify first.</td></tr>'}

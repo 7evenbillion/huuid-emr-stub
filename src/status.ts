@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
-import { cacheStats } from './cache.js';
+import { cacheStats, isDbFileEncrypted } from './cache.js';
 import { localAuthDiagnostics } from './local-auth.js';
 
 /**
@@ -14,11 +14,12 @@ export function getSystemStatus() {
   const auth = localAuthDiagnostics();
   const cache = cacheStats();
   const facilityKeyPresent = existsSync(config.HUUID_FACILITY_PRIVATE_KEY_PATH);
+  const encryption = isDbFileEncrypted(cache.dbPath);
 
   return {
     stubVersion: '0.1.2',
     cache: {
-      encrypted: false, // SQLCipher not built yet -- explicitly deferred this step
+      encrypted: encryption.fileExists ? encryption.encrypted : null, // null: DB not created yet, nothing to verify
       totalEntries: cache.totalEntries,
       dbPath: cache.dbPath,
     },

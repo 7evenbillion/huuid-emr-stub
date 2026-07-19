@@ -1,7 +1,9 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
+import { Database } from '@signalapp/sqlcipher';
+import { mkdirSync, existsSync, chmodSync, openSync, readSync, closeSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { loadConfig } from './config.js';
+import { deriveCacheKeyHex } from './cache-key.js';
 
 export type CacheSource = 'resolver' | 'qr_card';
 
@@ -24,14 +26,66 @@ const TTL_SECONDS: Record<CacheSource, number> = {
 
 const MAX_ENTRIES = 50000;
 
-let db: Database.Database | null = null;
+/** Real SQLite files always start with this exact 16-byte ASCII header. An
+ * SQLCipher-encrypted file's first page is fully encrypted, including this
+ * region, so it never matches -- this is what npm run diagnostics uses to
+ * prove encryption is active (Step 4). */
+const SQLITE_MAGIC_HEADER = 'SQLite format 3\0';
 
-function getDb(): Database.Database {
+let db: Database | null = null;
+
+/**
+ * Restricts the cache DB file to the current user only (Step 5). Best-effort
+ * on both platforms -- a failure here is logged but does not stop the server,
+ * since the encryption itself (not the filesystem ACL) is the actual
+ * confidentiality boundary per P1.
+ */
+function restrictDbFilePermissions(path: string): void {
+  try {
+    if (process.platform === 'win32') {
+      const user = process.env.USERNAME ?? process.env.USER;
+      if (!user) return;
+      execFileSync('icacls', [path, '/inheritance:r', '/grant:r', `${user}:F`], {
+        stdio: 'ignore',
+      });
+    } else {
+      chmodSync(path, 0o600);
+    }
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: 'warn',
+        event: 'cache_file_permission_restriction_failed',
+        detail: err instanceof Error ? err.message : 'unknown',
+        timestamp: new Date().toISOString(),
+      })
+    );
+  }
+}
+
+function getDb(): Database {
   if (db) return db;
   const config = loadConfig();
   mkdirSync(dirname(config.HUUID_CACHE_DB_PATH), { recursive: true });
+
+  const keyHex = deriveCacheKeyHex(); // throws with a clear message if the facility private key is missing
+
   db = new Database(config.HUUID_CACHE_DB_PATH);
-  db.pragma('journal_mode = WAL');
+  // Raw pre-derived key (Step 2's HKDF output) via SQLCipher's x'...' hex-key
+  // syntax -- this bypasses SQLCipher's own passphrase KDF entirely.
+  db.pragma(`key = "x'${keyHex}'"`);
+  db.pragma('cipher_page_size = 4096');
+  // kdf_iter is a no-op in raw-key mode (verified empirically: SQLCipher only
+  // runs its internal PBKDF2 when deriving a key from a passphrase). Set for
+  // fidelity with the spec anyway -- it does not weaken or strengthen
+  // anything here, since HKDF already produced uniform 256-bit key material.
+  db.pragma('kdf_iter = 256000');
+  // NOTE: `PRAGMA cipher = 'aes-256-gcm'` is intentionally NOT set here.
+  // SQLCipher has no GCM mode -- verified against the SQLCipher API docs and
+  // empirically (the pragma is silently accepted but `PRAGMA cipher` still
+  // reports aes-256-cbc afterward). SQLCipher's real authenticated encryption
+  // is AES-256-CBC + HMAC-SHA512 (both defaults, left untouched below).
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS huuid_local_cache (
       local_patient_id TEXT PRIMARY KEY,
@@ -45,7 +99,19 @@ function getDb(): Database.Database {
       token_expires_at INTEGER
     );
   `);
+
+  restrictDbFilePermissions(config.HUUID_CACHE_DB_PATH);
   return db;
+}
+
+/**
+ * Eagerly opens (and if needed creates + encrypts) the cache DB, so startup
+ * failures -- most importantly a missing facility private key -- surface as
+ * one clear message before the server starts accepting requests, rather than
+ * as an unhandled exception on the first request (Step 4/DoD item 8).
+ */
+export function initializeCache(): void {
+  getDb();
 }
 
 interface Row {
@@ -77,7 +143,7 @@ function rowToEntry(row: Row): CacheEntry {
 export function getCacheEntry(localPatientId: string): CacheEntry | null {
   const row = getDb()
     .prepare('SELECT * FROM huuid_local_cache WHERE local_patient_id = ?')
-    .get(localPatientId) as Row | undefined;
+    .get([localPatientId]) as Row | undefined;
   return row ? rowToEntry(row) : null;
 }
 
@@ -95,10 +161,10 @@ export function upsertCacheEntry(entry: Omit<CacheEntry, 'verifiedAt'> & { verif
 
   const exists = database
     .prepare('SELECT 1 FROM huuid_local_cache WHERE local_patient_id = ?')
-    .get(entry.localPatientId);
+    .get([entry.localPatientId]);
 
   if (!exists) {
-    const count = (database.prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get() as { n: number }).n;
+    const count = (database.prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get([]) as { n: number }).n;
     if (count >= MAX_ENTRIES) {
       return { cached: false };
     }
@@ -152,14 +218,35 @@ export function cacheAgeSeconds(entry: CacheEntry, nowSeconds = Math.floor(Date.
 export function listCacheEntries(limit = 100): CacheEntry[] {
   const rows = getDb()
     .prepare('SELECT * FROM huuid_local_cache ORDER BY verified_at DESC LIMIT ?')
-    .all(limit) as Row[];
+    .all([limit]) as unknown as Row[];
   return rows.map(rowToEntry);
 }
 
 export function cacheStats(): { totalEntries: number; dbPath: string } {
   const config = loadConfig();
-  const n = (getDb().prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get() as { n: number }).n;
+  const n = (getDb().prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get([]) as { n: number }).n;
   return { totalEntries: n, dbPath: config.HUUID_CACHE_DB_PATH };
+}
+
+/**
+ * Step 4's verification: proves the DB file is not a plain SQLite file by
+ * checking for the standard 16-byte magic header every real SQLite file
+ * starts with. An encrypted SQLCipher file's first page -- header included
+ * -- is ciphertext, so it never matches.
+ */
+export function isDbFileEncrypted(path: string): { fileExists: boolean; encrypted: boolean } {
+  if (!existsSync(path)) {
+    return { fileExists: false, encrypted: false };
+  }
+  const header = Buffer.alloc(16);
+  const fd = openSync(path, 'r');
+  try {
+    readSync(fd, header, 0, 16, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const isPlainSqlite = header.toString('utf8') === SQLITE_MAGIC_HEADER;
+  return { fileExists: true, encrypted: !isPlainSqlite };
 }
 
 export function closeDb(): void {
