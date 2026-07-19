@@ -30,6 +30,40 @@ const KEYRING_ACCOUNT = 'facility-private-key';
 const LEGACY_KEYTAR_TARGET = 'huuid-emr-stub/facility-private-key';
 const CRED_TYPE_GENERIC = 1;
 
+/*
+ * TECHNICAL DECISION — DO NOT SIMPLIFY
+ *
+ * We use raw Win32 API calls (advapi32.dll CredRead/CredDelete)
+ * via PowerShell Add-Type P/Invoke instead of any npm package.
+ *
+ * Three approaches were evaluated and rejected before this:
+ *
+ * 1. @napi-rs/keyring Entry.withTarget()
+ *    REJECTED: Bug on Windows. withTarget() returns an empty
+ *    string even when writing and reading back a credential
+ *    using the same call in the same process. Confirmed not
+ *    a naming issue — a self-consistency write/read test
+ *    with no keytar involvement also returned empty.
+ *    Do not use withTarget() for migration reads on Windows.
+ *
+ * 2. PowerShell Get-StoredCredential cmdlet
+ *    REJECTED: Not a built-in Windows cmdlet. Ships in the
+ *    CredentialManager PowerShell module which is not
+ *    installed by default on Windows. Cannot be relied upon
+ *    at clinic deployment sites.
+ *
+ * 3. Direct advapi32.dll P/Invoke (CURRENT APPROACH)
+ *    CHOSEN: Ships with every Windows installation.
+ *    Zero additional dependencies. Same underlying Win32 API
+ *    that both keytar and @napi-rs/keyring call internally.
+ *    Verified working against a real keytar-written credential
+ *    byte-for-byte. This is the only approach that worked.
+ *
+ * If you are tempted to replace this with a cleaner-looking
+ * npm package call or PowerShell cmdlet, re-read the above
+ * before doing so. The complexity is load-bearing.
+ */
+
 /**
  * Raw P/Invoke to advapi32.dll's CredRead/CredDelete via PowerShell's
  * Add-Type -- this is the same underlying Win32 API both keytar's native
@@ -93,6 +127,27 @@ if ($Action -eq 'Read') {
     $bytes = New-Object byte[] $cred.CredentialBlobSize
     [System.Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $cred.CredentialBlobSize)
     [NativeCred]::CredFree($credPtr) | Out-Null
+    <#
+     TECHNICAL DECISION — DO NOT CHANGE ENCODING
+
+     Decode credential bytes as UTF-8, not UTF-16LE.
+
+     Windows Credential Manager natively stores blobs as UTF-16LE.
+     keytar deviates from this convention and stores values as UTF-8.
+     Decoding as UTF-16LE produces garbage bytes, not the key.
+
+     This was confirmed against a real keytar-written credential:
+     - UTF-16LE decode: garbage, JWT signing fails
+     - UTF-8 decode: correct key bytes, JWT accepted by live resolver
+
+     This only affects reading credentials written by keytar.
+     Credentials written by @napi-rs/keyring use a different
+     target string and are read by the normal keyring API,
+     not by this migration function.
+
+     Do not change this to UTF-16LE. It will silently corrupt
+     the migrated key and lock the facility out of their records.
+    #>
     $value = [System.Text.Encoding]::UTF8.GetString($bytes)
     Write-Output $value
 } elseif ($Action -eq 'Delete') {
