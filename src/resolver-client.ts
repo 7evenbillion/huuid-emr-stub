@@ -1,7 +1,7 @@
-import { SignJWT, importPKCS8 } from 'jose';
-import { readFileSync } from 'node:fs';
+import { SignJWT } from 'jose';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from './config.js';
+import { getFacilityPrivateKeyRaw, buildEd25519KeyObjectFromRaw } from './facility-key.js';
 
 /**
  * Fixed per HUUID-RESOLVER-API-v0.2 Section 2.1 -- the resolver's own JWT
@@ -32,34 +32,29 @@ export interface LiveResolverFailure {
 
 export type LiveResolverResult = LiveResolverSuccess | LiveResolverFailure;
 
-let cachedPrivateKey: Awaited<ReturnType<typeof importPKCS8>> | null = null;
-
 /**
- * `download-keys` has no real endpoint to call yet (see README) -- for now the
- * facility private key must be placed manually at HUUID_FACILITY_PRIVATE_KEY_PATH
- * as a PKCS8 PEM, per the Section 4 install checklist's file layout.
+ * No caching of the signing key here (deliberately -- see Step 7 of this
+ * build step). Keystore-first, file-fallback via facility-key.ts (Step 4);
+ * `download-keys` still has no real endpoint to call (see README), so the
+ * file fallback still requires a manually-placed PKCS8 PEM until either that
+ * endpoint exists or npm run secure-keys has moved the key to the keystore.
+ *
+ * Raw key bytes are fetched fresh for every signing call and zeroed
+ * immediately after the KeyObject is built -- "zero out the key bytes"
+ * after every signing operation, not just once at process start.
  */
-async function loadFacilityPrivateKey() {
-  if (cachedPrivateKey) return cachedPrivateKey;
-  const config = loadConfig();
-  let pem: string;
-  try {
-    pem = readFileSync(config.HUUID_FACILITY_PRIVATE_KEY_PATH, 'utf8');
-  } catch {
-    throw new Error(
-      `Facility private key not found at ${config.HUUID_FACILITY_PRIVATE_KEY_PATH}. ` +
-        `Run npm run download-keys for instructions -- there is no live key-distribution ` +
-        `endpoint on the resolver yet, so this file must be placed manually for now.`
-    );
-  }
-  cachedPrivateKey = await importPKCS8(pem, 'EdDSA');
-  return cachedPrivateKey;
-}
-
 async function signFacilityJWT(purposeCode: PurposeCode, requestId: string): Promise<string> {
   const config = loadConfig();
-  const key = await loadFacilityPrivateKey();
   const now = Math.floor(Date.now() / 1000);
+
+  const { bytes: rawKey } = await getFacilityPrivateKeyRaw();
+  let signingKey;
+  try {
+    signingKey = buildEd25519KeyObjectFromRaw(rawKey);
+  } finally {
+    rawKey.fill(0);
+  }
+
   return new SignJWT({
     huuid_purpose: purposeCode,
     huuid_facility_code: config.HUUID_FACILITY_CODE,
@@ -71,7 +66,7 @@ async function signFacilityJWT(purposeCode: PurposeCode, requestId: string): Pro
     .setSubject(config.HUUID_FACILITY_DID)
     .setAudience(RESOLVER_AUD)
     .setJti(requestId)
-    .sign(key);
+    .sign(signingKey);
 }
 
 interface ResolutionResponseBody {

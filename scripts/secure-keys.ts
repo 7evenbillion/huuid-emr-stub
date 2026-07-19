@@ -1,15 +1,77 @@
+import keytar from 'keytar';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync } from 'node:fs';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { loadConfig } from '../src/config.js';
+import { rawKeyFromPem, KEYTAR_SERVICE, KEYTAR_ACCOUNT } from '../src/facility-key.js';
+
+const config = loadConfig();
+const pemPath = config.HUUID_FACILITY_PRIVATE_KEY_PATH;
+
+if (!existsSync(pemPath)) {
+  console.error(`No facility private key found at ${pemPath}. Nothing to secure.`);
+  process.exit(1);
+}
+
+// Step 1: read the key from the file.
+const pem = readFileSync(pemPath, 'utf8');
+let rawBytes: Buffer;
+try {
+  rawBytes = rawKeyFromPem(pem);
+} catch (err) {
+  console.error(`Could not read the key at ${pemPath}: ${err instanceof Error ? err.message : 'unknown error'}`);
+  process.exit(1);
+}
+
+// Step 2: store in the OS keystore.
+const encoded = rawBytes.toString('base64url');
+await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT, encoded);
+
+// Step 3: retrieve immediately to verify storage worked.
+const retrieved = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT);
+
+const matches =
+  retrieved !== null &&
+  retrieved.length === encoded.length &&
+  timingSafeEqual(Buffer.from(retrieved), Buffer.from(encoded));
+
+rawBytes.fill(0);
+
+if (!matches) {
+  // Step 5: HALT. Do not delete the .pem file.
+  console.error(
+    'Key verification FAILED after storing to the OS keystore -- the value read back did not match ' +
+      'what was written. The .pem file has NOT been deleted. Check OS keystore access ' +
+      '(Credential Manager / Keychain / libsecret) and try again.'
+  );
+  process.exit(1);
+}
+
+// Step 4: shred the .pem file, then delete it.
+shredFile(pemPath);
+unlinkSync(pemPath);
+
+console.log('Key imported to OS keystore.');
+console.log('facility-private-key.pem deleted.');
+
 /**
- * NOT IMPLEMENTED -- explicitly deferred per the build instructions for this
- * step ("Do not build OS keystore yet ... those are the next steps after
- * this base works. One layer at a time.").
- *
- * When built, this will import the facility private key into the OS
- * credential store (Windows Credential Manager / macOS Keychain / Linux
- * libsecret via `keytar`) and shred the .pem file, per Section 2 P2 of
- * HUUID-EMR-STUB-v0.1.2.docx. Until then, the private key stays as a plain
- * file at HUUID_FACILITY_PRIVATE_KEY_PATH -- a known, temporary, and
- * explicitly-flagged insecurity, not a silent one.
+ * Overwrites the file's on-disk bytes before unlinking. This defeats naive
+ * undelete/recovery tools that only look at directory-entry-level deletion --
+ * it does NOT guarantee the original plaintext is unrecoverable at the
+ * physical storage layer. Modern SSDs (wear-leveling), copy-on-write
+ * filesystems, and journaling can all retain copies of the old blocks
+ * regardless of what gets written to the logical file path. Flagged here
+ * rather than claimed as a stronger guarantee than it is.
  */
-console.log('secure-keys: NOT IMPLEMENTED (deferred to the OS-keystore hardening step).');
-console.log('The facility private key remains a plain PEM file for this build. See README.md.');
-process.exit(1);
+function shredFile(path: string): void {
+  const size = statSync(path).size;
+  if (size === 0) return;
+
+  if (process.platform === 'win32') {
+    // "Multi-pass overwrite" per Step 2.4 -- zeros, then random, then zeros.
+    writeFileSync(path, Buffer.alloc(size, 0));
+    writeFileSync(path, randomBytes(size));
+    writeFileSync(path, Buffer.alloc(size, 0));
+  } else {
+    writeFileSync(path, Buffer.alloc(size, 0));
+  }
+}

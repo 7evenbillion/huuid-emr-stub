@@ -56,7 +56,7 @@ export async function verifyPatient(
   _options: VerifyPatientOptions
 ): Promise<HUUIDResult> {
   const now = Math.floor(Date.now() / 1000);
-  const cached = getCacheEntry(localPatientId);
+  const cached = await getCacheEntry(localPatientId);
 
   if (cached) {
     const age = cacheAgeSeconds(cached, now);
@@ -81,7 +81,7 @@ export async function verifyPatient(
     // "refuse").
     const live = await resolveViaLiveResolver(localPatientId, purposeCode);
     if (live.ok) {
-      persistToCache(localPatientId, live);
+      await persistToCache(localPatientId, live);
       return resultFromLive(live, 'resolver');
     }
     return resultFromCache(cached, age);
@@ -90,7 +90,7 @@ export async function verifyPatient(
   // No cache at all -- must attempt a live resolution (see gap note above).
   const live = await resolveViaLiveResolver(localPatientId, purposeCode);
   if (live.ok) {
-    persistToCache(localPatientId, live);
+    await persistToCache(localPatientId, live);
     return resultFromLive(live, 'resolver');
   }
 
@@ -110,8 +110,8 @@ export async function verifyPatient(
   };
 }
 
-function persistToCache(localPatientId: string, live: LiveResolverSuccess): void {
-  upsertCacheEntry({
+async function persistToCache(localPatientId: string, live: LiveResolverSuccess): Promise<void> {
+  await upsertCacheEntry({
     localPatientId,
     huuid: live.huuid,
     displayName: live.displayName,
@@ -157,7 +157,7 @@ async function refreshInBackground(localPatientId: string, purposeCode: PurposeC
   try {
     const live = await resolveViaLiveResolver(localPatientId, purposeCode);
     if (live.ok) {
-      persistToCache(localPatientId, live);
+      await persistToCache(localPatientId, live);
     }
   } catch {
     // Best-effort -- background refresh failures are never surfaced to the caller.

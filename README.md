@@ -10,18 +10,55 @@ the Next.js resolver (`huuid-resolver`). It runs locally at each clinic.
 
 ## Status
 
-**Base build + Security Layer 1 (SQLCipher cache encryption, P1).** The
-local cache DB is now AES-256-CBC + HMAC-SHA512 encrypted (SQLCipher's real
-cipher -- not GCM, see below), keyed by HKDF-SHA256 over the facility
-private key. **Explicitly not implemented yet** (by design, one layer at a
-time):
+**Base build + Security Layer 1 (SQLCipher, P1) + Security Layer 2 (OS
+keystore, P2).** The local cache DB is AES-256-CBC + HMAC-SHA512 encrypted
+(SQLCipher's real cipher -- not GCM, see below), keyed by HKDF-SHA256 over
+the facility private key. The facility private key itself now lives in the
+OS credential store (Windows Credential Manager / macOS Keychain / Linux
+libsecret via `keytar`) once `npm run secure-keys` has been run -- the PEM
+file is shredded and deleted at that point. A file fallback remains for the
+transition period before that script has been run. **Explicitly not
+implemented yet** (by design, one layer at a time):
 
-- OS keystore for the facility private key (P2) -- it is still a plain PEM
-  file, just no longer the cache encryption key source in plaintext form
 - Integrity baseline / HMAC monitoring (P4)
 - QR card offline verification (resolution tier 4)
 
-`npm run diagnostics` reports all of these honestly as not-yet-started.
+`npm run diagnostics` reports both honestly as not-yet-started.
+
+### `keytar` is unmaintained upstream
+
+Flagged, not hidden: `keytar`'s last release was over a year ago and its
+GitHub repo has been archived. It was the package this build step named,
+and it does work correctly here (verified: install, load, and a full
+Windows Credential Manager set/get/delete roundtrip all succeed). Worth
+knowing before relying on it long-term, unlike the SQLCipher package swap
+last step, this wasn't a functional blocker so it wasn't treated as one --
+just a maintenance-risk note for whoever revisits this dependency.
+
+### Where the facility private key actually lives now
+
+`src/facility-key.ts` is the single source of truth: keystore first, PEM
+file fallback, clear error if neither has a key. Two implementation details
+worth knowing:
+
+- **Raw-bytes reconstruction, not PEM round-tripping.** The keystore stores
+  only the raw 32-byte Ed25519 private scalar (base64url). Rebuilding a
+  usable signing key from just that requires the RFC 8410 PKCS8 DER prefix
+  for Ed25519 (fixed, 16 bytes, same for every key) rather than Node's JWK
+  import, which insists on the public key (`x`) even though it's
+  mathematically redundant for Ed25519. This also avoids ever creating an
+  intermediate PEM string, which -- being an immutable JS string -- could
+  not be zeroed anyway (see below).
+- **Memory zeroing (Step 7) is real but string-limited.** Every raw-bytes
+  `Buffer` touching the private key is `.fill(0)`'d immediately after use
+  (`cache-key.ts`, `facility-key.ts`, `resolver-client.ts`,
+  `scripts/secure-keys.ts`). `resolver-client.ts` no longer caches a signing
+  key across requests -- it fetches raw bytes, builds a key, signs, and
+  zeroes on every single call, per this step's literal wording. What
+  *cannot* be zeroed: the base64url string `keytar.getPassword()` returns,
+  or a PEM string, since JS strings are immutable and nothing can wipe their
+  backing memory from JS code. This is a real limit of the runtime, not an
+  oversight -- documented rather than glossed over.
 
 ### SQLCipher package: `@signalapp/sqlcipher`, not `@journeyapps/sqlcipher`
 
@@ -106,11 +143,20 @@ npm run start
 | `install-service` (Windows) | Implemented -- generates a wrapper + prints `sc.exe` commands; does not self-elevate |
 | `install-systemd` (Linux) | Implemented -- generates a unit file + prints `systemctl` commands; does not self-install |
 | `download-keys` | Not implemented -- no live endpoint yet |
-| `secure-keys` | Not implemented -- deferred (OS keystore) |
+| `secure-keys` | Implemented -- imports the facility key to the OS keystore, verifies the roundtrip, then shreds + deletes the PEM. Halts without deleting anything if verification fails. |
 | `install-integrity-baseline` | Not implemented -- deferred (HMAC monitoring) |
 
 `npm run diagnostics` also verifies cache encryption is active (checks the
-DB file lacks SQLite's plaintext magic header) and reports `Cache: ENCRYPTED`.
+DB file lacks SQLite's plaintext magic header) and reports `Cache: ENCRYPTED`,
+and reports `Key storage: KEYSTORE / FILE / MISSING` with a warning or error
+as appropriate.
+
+**Note on `scripts/secure-keys.ts`'s location:** this build step's brief
+named `src/scripts/secure-keys.ts` as the file path. The repo's established
+convention -- and the already-registered `package.json` script -- puts every
+CLI script at the top-level `scripts/`, so the implementation lives at
+`scripts/secure-keys.ts` (same place as the rest) rather than creating a
+second, disconnected path under `src/`.
 
 ## Routes
 

@@ -9,10 +9,11 @@ import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from
 const config = loadConfig();
 
 // Open (and encrypt, if not already) the cache DB before accepting any
-// requests, so a missing facility private key is one clear message and a
-// clean exit -- not a crash on the first POST /verify (Step 4 / DoD item 8).
+// requests, so a missing facility private key (in both the keystore and the
+// file fallback) is one clear message and a clean exit -- not a crash on the
+// first POST /verify (Step 4/6 of the SQLCipher step, DoD item 6 this step).
 try {
-  initializeCache();
+  await initializeCache();
 } catch (err) {
   console.error(`Cache initialization failed: ${err instanceof Error ? err.message : 'unknown error'}`);
   process.exit(1);
@@ -28,16 +29,17 @@ const verifyBodySchema = z.object({
 
 // GET /health -- system status. Deliberately unauthenticated, matching the
 // resolver's own /api/health: monitoring shouldn't require a credential.
-app.get('/health', (_req: Request, res: Response) => {
-  const status = getSystemStatus();
+app.get('/health', async (_req: Request, res: Response) => {
+  const status = await getSystemStatus();
   res.status(200).json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     ...status,
-    // Flat fields per this build step's Step 6, alongside the nested
-    // `cache` object above (which already carries the same information).
+    // Flat fields per the SQLCipher step's Step 6 and this step's Step 6,
+    // alongside the nested objects above (which already carry the same info).
     cache_encrypted: status.cache.encrypted,
     cache_entries: status.cache.totalEntries,
+    key_storage: status.keys.storage,
   });
 });
 
@@ -61,9 +63,9 @@ app.post('/verify', localAuthMiddleware, async (req: Request, res: Response) => 
 // surface. Left unauthenticated on purpose (mirrors the main resolver's own
 // /debug/resolver page, which a human opens directly in a browser and can't
 // easily attach a custom header to).
-app.get('/debug/resolver', (_req: Request, res: Response) => {
-  const entries = listCacheEntries(100);
-  const stats = cacheStats();
+app.get('/debug/resolver', async (_req: Request, res: Response) => {
+  const entries = await listCacheEntries(100);
+  const stats = await cacheStats();
   const encryption = isDbFileEncrypted(stats.dbPath);
   const rows = entries
     .map(
@@ -101,9 +103,8 @@ app.get('/debug/qr', (_req: Request, res: Response) => {
 <body style="font-family:monospace;margin:2rem">
 <h1>QR Scan -- Not Implemented Yet</h1>
 <p>QR card verification (resolution tier 4, offline token signature check) is
-scheduled for the next Month 4 build step, after SQLCipher and OS keystore.
-This page exists so the route is present per Step 7, but it does not perform
-a scan.</p>
+scheduled for a later Month 4 build step, after integrity hashing. This page
+exists so the route is present, but it does not perform a scan.</p>
 </body></html>`);
 });
 

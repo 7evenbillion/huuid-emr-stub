@@ -63,12 +63,12 @@ function restrictDbFilePermissions(path: string): void {
   }
 }
 
-function getDb(): Database {
+async function getDb(): Promise<Database> {
   if (db) return db;
   const config = loadConfig();
   mkdirSync(dirname(config.HUUID_CACHE_DB_PATH), { recursive: true });
 
-  const keyHex = deriveCacheKeyHex(); // throws with a clear message if the facility private key is missing
+  const keyHex = await deriveCacheKeyHex(); // throws with a clear message if no facility private key is found anywhere
 
   db = new Database(config.HUUID_CACHE_DB_PATH);
   // Raw pre-derived key (Step 2's HKDF output) via SQLCipher's x'...' hex-key
@@ -110,8 +110,8 @@ function getDb(): Database {
  * one clear message before the server starts accepting requests, rather than
  * as an unhandled exception on the first request (Step 4/DoD item 8).
  */
-export function initializeCache(): void {
-  getDb();
+export async function initializeCache(): Promise<void> {
+  await getDb();
 }
 
 interface Row {
@@ -140,8 +140,9 @@ function rowToEntry(row: Row): CacheEntry {
   };
 }
 
-export function getCacheEntry(localPatientId: string): CacheEntry | null {
-  const row = getDb()
+export async function getCacheEntry(localPatientId: string): Promise<CacheEntry | null> {
+  const database = await getDb();
+  const row = database
     .prepare('SELECT * FROM huuid_local_cache WHERE local_patient_id = ?')
     .get([localPatientId]) as Row | undefined;
   return row ? rowToEntry(row) : null;
@@ -155,8 +156,10 @@ export function getCacheEntry(localPatientId: string): CacheEntry | null {
  * resolves a real tension in the spec (a hard cap + a no-delete rule can't both
  * hold via eviction) in the direction of "never delete" as the strict rule.
  */
-export function upsertCacheEntry(entry: Omit<CacheEntry, 'verifiedAt'> & { verifiedAt?: number }): { cached: boolean } {
-  const database = getDb();
+export async function upsertCacheEntry(
+  entry: Omit<CacheEntry, 'verifiedAt'> & { verifiedAt?: number }
+): Promise<{ cached: boolean }> {
+  const database = await getDb();
   const verifiedAt = entry.verifiedAt ?? Math.floor(Date.now() / 1000);
 
   const exists = database
@@ -215,16 +218,18 @@ export function cacheAgeSeconds(entry: CacheEntry, nowSeconds = Math.floor(Date.
 }
 
 /** For the /debug/resolver page -- most recently verified first. */
-export function listCacheEntries(limit = 100): CacheEntry[] {
-  const rows = getDb()
+export async function listCacheEntries(limit = 100): Promise<CacheEntry[]> {
+  const database = await getDb();
+  const rows = database
     .prepare('SELECT * FROM huuid_local_cache ORDER BY verified_at DESC LIMIT ?')
     .all([limit]) as unknown as Row[];
   return rows.map(rowToEntry);
 }
 
-export function cacheStats(): { totalEntries: number; dbPath: string } {
+export async function cacheStats(): Promise<{ totalEntries: number; dbPath: string }> {
   const config = loadConfig();
-  const n = (getDb().prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get([]) as { n: number }).n;
+  const database = await getDb();
+  const n = (database.prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get([]) as { n: number }).n;
   return { totalEntries: n, dbPath: config.HUUID_CACHE_DB_PATH };
 }
 
