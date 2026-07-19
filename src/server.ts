@@ -5,7 +5,7 @@ import { localAuthMiddleware } from './local-auth.js';
 import { verifyPatient, type PurposeCode } from './verify-patient.js';
 import { getSystemStatus } from './status.js';
 import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
-import { runIntegrityCheck } from './integrity-check.js';
+import { runIntegrityCheck, enforceStartupIntegrity } from './integrity-check.js';
 
 const config = loadConfig();
 
@@ -20,13 +20,15 @@ try {
   process.exit(1);
 }
 
-// Integrity check at startup -- deliberately does NOT block/exit on a
-// violation (see integrity-check.ts's doc comment for why). Re-run every 6
-// hours per Step 3 while the server is running; /health and diagnostics
-// report whichever run (startup or scheduled) happened most recently rather
-// than recomputing on every request, matching status.ts's "local-only, no
-// expensive recomputation" design.
-await runIntegrityCheck();
+// Integrity check at startup -- Gap 1 closure: a violation now leads to a
+// 60-second grace period and process.exit(1) unless HUUID_INTEGRITY_OVERRIDE
+// is set (see integrity-check.ts's doc comment on enforceStartupIntegrity).
+// This call can end the process; nothing after it should assume it always
+// returns. The 6-hour periodic recheck below intentionally uses the softer
+// runIntegrityCheck() directly, not this wrapper -- see that function's doc
+// comment for why forcibly killing an already-running server on a later
+// recheck is a different (and not requested) risk than gating startup.
+await enforceStartupIntegrity();
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 setInterval(() => {
   void runIntegrityCheck();
@@ -56,6 +58,15 @@ app.get('/health', async (_req: Request, res: Response) => {
     key_storage: status.keys.storage,
     integrity_baseline: status.integrity.baselineExists,
     integrity_status: status.integrity.lastCheckStatus,
+    integrity_override_active: status.integrity.overrideActive,
+    // Gap 1 closure: printed on every /health response while override is
+    // active, not just logged once at startup -- so anyone polling health
+    // (a dashboard, a human curling it) sees the facility is running in a
+    // degraded-trust state, not just whoever was watching the console when
+    // it started.
+    ...(status.integrity.overrideActive
+      ? { warning: 'WARNING: Running with integrity override active' }
+      : {}),
   });
 });
 

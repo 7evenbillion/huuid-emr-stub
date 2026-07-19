@@ -2,7 +2,7 @@ import { loadConfig } from './config.js';
 import { cacheStats, isDbFileEncrypted } from './cache.js';
 import { localAuthDiagnostics } from './local-auth.js';
 import { getKeyStorageStatus } from './facility-key.js';
-import { hasBaseline, getLastCheckStatus } from './integrity-check.js';
+import { hasBaseline, getLastCheckStatus, isIntegrityOverrideActive } from './integrity-check.js';
 
 const INTEGRITY_CHECK_INTERVAL_HOURS = 6;
 
@@ -33,6 +33,7 @@ export async function getSystemStatus() {
       baselineExists: hasBaseline(),
       lastCheckStatus: getLastCheckStatus(), // 'pass' | 'fail' | 'not_checked'
       checkIntervalHours: INTEGRITY_CHECK_INTERVAL_HOURS,
+      overrideActive: isIntegrityOverrideActive(),
     },
     auth: {
       secretConfigured: auth.secretConfigured,

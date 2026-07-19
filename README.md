@@ -177,16 +177,30 @@ baseline.hmac` read-only (`attrib +r` on Windows, `chmod 444` elsewhere).
 `npm run start` recomputes and verifies the same manifest on every
 startup and every 6 hours thereafter (`src/integrity-check.ts`).
 
-**Deferred by design, not by oversight: a mismatch does NOT stop the
-Stub from starting.** The doc says a mismatch should refuse to start.
-This build deliberately doesn't do that yet -- refusing to start on any
-manifest mismatch risks bricking a clinic machine over a stale baseline
-(e.g. a legitimate `npm update` that wasn't followed by re-running
-`install-integrity-baseline`), which is a worse outcome for patient care
-than a facility running while flagged. The alert to the Root Authority
-(`POST /1.0/stub-integrity` on the resolver) is the load-bearing piece
-for now; `integrityViolation` is tracked and surfaced via `/health` and
-`npm run diagnostics`, but the server keeps running.
+**Gap 1 CLOSED: a startup mismatch now refuses to start, with a 60-second
+emergency-override grace period.** Originally deferred over the risk of
+bricking a clinic machine on a stale baseline; now closed with a middle
+ground rather than left open indefinitely. On a startup violation:
+the Stub logs `INTEGRITY_VIOLATION`, sends an alert, then prints a
+warning every 10 seconds for 60 seconds ("Server will refuse to start in
+Xs... set HUUID_INTEGRITY_OVERRIDE=1... and restart within 60 seconds").
+If nothing overrides it, `process.exit(1)`. If `HUUID_INTEGRITY_OVERRIDE=1`
+is set when the Stub is (re)launched, it starts immediately instead --
+logs the override, sends a **second** alert with `override: true`, and
+`/health` carries `integrity_override_active: true` plus a `warning`
+field on every response for as long as that process runs. The override
+is read once at startup (matching "restart within 60 seconds" -- a new
+process launch with the var already set, not a live process somehow
+observing an external env change mid-countdown), so a genuine attacker
+who doesn't know to set it is locked out; a false positive (the CRLF
+gotcha below, or a legitimate update) is a documented IT-technician
+recovery path; a real emergency lets a clinician override and keep
+treating the patient while the Root Authority is alerted either way.
+**Scoped to startup only** -- the 6-hour periodic recheck still uses the
+original soft-fail behavior (log + alert + keep running); forcibly
+killing a server that's been running fine and serving patients for hours
+over a later recheck would be a new and much riskier behavior this
+wasn't asked to add.
 
 **Real gotcha, not a bug: `git checkout`/`git pull` on Windows can trip a
 false-positive violation.** Found while testing the tamper-then-restore
@@ -220,15 +234,25 @@ deterministically derivable from the private seed -- see
 tamper-detection needs; it is not a claim that some other party has
 independently attested to the key's legitimacy.
 
-**Resolver side: the alert endpoint doesn't verify the signature yet.**
-`POST /1.0/stub-integrity` (in the `huuid-resolver` repo) accepts, logs
-to `huuid_stub_integrity_log`, and returns 200 -- deliberately minimal,
-matching this step's scope. It does NOT check the payload's `signature`
-against the reporting facility's public key before writing the row. "No
-auth required because it's signed" is only true once something actually
-checks the signature; until then, treat this table as a diagnostic log
-of self-reported claims, not a verified audit trail. Flagged in both the
-route and its migration file, not silently treated as trusted.
+**Gap 2 CLOSED: the resolver now verifies the alert signature before
+logging anything.** `POST /1.0/stub-integrity` looks up the claimed
+facility's public key (`huuid_facilities.public_key_multibase`), verifies
+the payload's `signature` against `manifestHash`, and rejects rather than
+logs an unverified request: unknown facility -> `403`, missing/invalid
+signature -> `401`. Only a verified alert is written, with
+`signature_verified: true` recorded alongside it. Verification uses the
+exact same raw-bytes construction the Stub signs with (`Buffer.from(
+manifestHash, 'utf8')`, no pre-hash) -- **not** the Break-Glass
+`requestSignature` pattern (SHA-256 of a canonical-JSON body first,
+`bg-request-signature.ts`), which is a different construction that would
+make every genuine signature fail to verify if used here by mistake. See
+`huuid-resolver/api.md` for the full endpoint contract and
+`huuid-resolver/lib/stub-integrity-signature.ts` for the verification
+code. An `override` column was also added to `huuid_stub_integrity_log`
+(migration 008) -- a gap Gap 2's own combined-testing requirement
+surfaced but its stated scope didn't cover: an override alert (Gap 1)
+needs somewhere to record `override: true`, which didn't exist until
+this was added.
 
 ## Setup
 

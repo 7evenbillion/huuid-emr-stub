@@ -3,6 +3,7 @@ import { pingResolver } from '../src/resolver-client.js';
 import { cacheStats, isDbFileEncrypted } from '../src/cache.js';
 import { getMigrationOutcome } from '../src/keystore-migration.js';
 import { runIntegrityCheck } from '../src/integrity-check.js';
+import { loadConfig } from '../src/config.js';
 
 // diagnostics.ts runs as its own one-shot process, separate from any
 // running `npm run start` -- integrity-check.ts's last-check state is only
@@ -59,11 +60,23 @@ if (!status.integrity.baselineExists) {
 const lastCheckLabel = { pass: 'PASS', fail: 'FAIL', not_checked: 'NOT RUN' }[status.integrity.lastCheckStatus];
 console.log(`Last integrity check: ${lastCheckLabel}`);
 console.log(`Integrity check interval: ${status.integrity.checkIntervalHours} hours`);
+// diagnostics.ts is a fresh, one-shot process -- it never calls
+// enforceStartupIntegrity(), so status.integrity.overrideActive (only set
+// by that function) is always false here regardless of what a running
+// server did. What's actually useful to report from a standalone process
+// is whether the override is CONFIGURED right now -- i.e. whether the
+// next `npm run start` would bypass a violation without a fresh decision.
+const overrideConfigured = loadConfig().HUUID_INTEGRITY_OVERRIDE;
+console.log(`Integrity override: ${overrideConfigured ? 'ACTIVE (WARNING)' : 'inactive'}`);
 console.log('');
 
 const report = {
   timestamp: new Date().toISOString(),
   ...status,
+  integrity: {
+    ...status.integrity,
+    overrideConfigured,
+  },
   keytarMigration: getMigrationOutcome(),
   resolver: {
     ...status.resolver,

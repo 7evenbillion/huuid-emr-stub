@@ -37,6 +37,14 @@ const envSchema = z.object({
   HUUID_RESOLVER_PUBLIC_KEY_PATH: z.string().default('./keys/resolver-public-key.pem'),
 
   HUUID_CACHE_DB_PATH: z.string().default('./data/huuid-cache.db'),
+
+  // Emergency override for a startup integrity-check failure (Gap 1
+  // closure). '1' bypasses the 60-second grace-period exit; anything else
+  // (including unset) does not.
+  HUUID_INTEGRITY_OVERRIDE: z
+    .enum(['0', '1'])
+    .default('0')
+    .transform((v) => v === '1'),
 });
 
 export type StubConfig = z.infer<typeof envSchema>;

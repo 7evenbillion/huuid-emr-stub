@@ -192,26 +192,22 @@ for one feature.
 
 ---
 
-## 9. Startup tamper check does not refuse to start
+## 9. Startup tamper check -- history and current state
 
-**Decision:** An integrity violation is logged and
-alerted, but the Stub still starts. Deferred from the
-spec's "refuse to start if tampered."
+**Original decision (superseded, see §10):** An
+integrity violation was logged and alerted, but the
+Stub still started. Deferred from the spec's "refuse
+to start if tampered," over the risk of bricking a
+clinic machine on a stale baseline. **This is now
+closed -- see §10 for the grace-period/override
+mechanism that replaced it.** Left here for history;
+do not read this section as describing current
+behavior.
 
-**Why:**
-Refusing to start on any manifest mismatch risks
-bricking a clinic machine over a stale baseline (e.g.
-a legitimate npm update not followed by re-running
-install-integrity-baseline) -- a worse outcome for
-patient care than running while flagged. The alert to
-the Root Authority is the load-bearing piece for this
-step; `integrityViolation` is tracked and surfaced via
-/health and diagnostics.
-
-**Real gotcha found while testing this:** `git
-checkout`/`git pull` on Windows can trip a
-false-positive violation. Restoring a file via `git
-checkout` produced CRLF line endings (Windows'
+**Real gotcha found while testing this, still
+current:** `git checkout`/`git pull` on Windows can
+trip a false-positive violation. Restoring a file via
+`git checkout` produced CRLF line endings (Windows'
 core.autocrlf) even though the text was identical to
 what the baseline was computed from (LF) -- a
 byte-different file the manifest correctly flagged as
@@ -219,15 +215,80 @@ changed. Re-running install-integrity-baseline after
 any git pull that could touch line endings is a real
 operational step, not just after intentional edits.
 
-**Resolver-side gap, not yet closed:** POST
-/1.0/stub-integrity accepts, logs, and returns 200 but
-does not verify the payload's signature against the
-reporting facility's public key before writing the
-row. Treat huuid_stub_integrity_log as a diagnostic
-log of self-reported claims for this step, not a
-verified audit trail.
+**Resolver-side signature verification gap: also now
+closed, see §11.**
 
-**Do not change either the no-refuse-to-start
-behavior or the resolver's accept-without-verify
-behavior without addressing both flagged gaps above
-first.**
+---
+
+## 10. Startup grace period + emergency override (Gap 1 closure)
+
+**Decision:** A startup integrity violation now leads
+to a 60-second countdown (printed every 10s) and
+`process.exit(1)`, UNLESS `HUUID_INTEGRITY_OVERRIDE=1`
+is set at process launch, in which case the Stub
+starts immediately with a logged warning, a second
+alert (`override: true`), and `/health` carrying
+`integrity_override_active: true` plus a `warning`
+field on every response for the life of that process.
+
+**Why this design specifically:**
+The override is read ONCE, at startup -- not polled
+during the countdown. "Restart within 60 seconds"
+means a NEW process launch with the var already set,
+not a live process somehow observing an external env
+change mid-countdown. This is why a failing process
+just counts down to its own death regardless of what
+happens elsewhere: the countdown's only job is to make
+the failure visible long enough (with periodic
+reminders) for an operator to notice, decide, and
+relaunch -- not to wait for a live signal.
+
+**Why scoped to startup only, not the 6-hour periodic
+recheck:** Forcibly killing a server that has been
+running fine and serving patients for hours, on a
+LATER recheck, is a materially different (and worse)
+risk than gating startup -- not requested, not built.
+`runIntegrityCheck()` (the periodic recheck) keeps its
+original soft-fail behavior unchanged;
+`enforceStartupIntegrity()` (new, startup-only) wraps
+it with the countdown/exit/override logic.
+
+**Do not make the periodic recheck also refuse to
+continue running without a fresh design discussion --
+that changes the risk calculus this section describes.**
+
+---
+
+## 11. Resolver signature verification (Gap 2 closure)
+
+**Decision:** POST /1.0/stub-integrity now verifies
+the payload's EdDSA `signature` against the claimed
+facility's public key (huuid_facilities
+.public_key_multibase) before logging anything.
+Unknown facility -> 403, not logged. Invalid/missing
+signature -> 401, not logged. Verified -> logged with
+signature_verified: true, 200.
+
+**Why NOT the Break-Glass requestSignature pattern:**
+bg-request-signature.ts verifies SHA-256(canonical_json
+(body_minus_signature)) -- a different construction.
+The Stub's integrity-manifest.ts signs the raw UTF-8
+bytes of manifestHash directly, no pre-hash. Verifying
+with the Break-Glass pattern would make every genuine
+signature fail. New lib/stub-integrity-signature.ts
+matches the Stub's actual signing exactly:
+crypto.verify(null, Buffer.from(manifestHash, 'utf8'),
+publicKey, signature).
+
+**Extra gap found and fixed, not in the stated scope:**
+Gap 2's own combined-testing requirement (an override
+alert from Gap 1 must be "logged with override: true")
+needed a column that didn't exist and wasn't in the
+specified migration. Migration 008 adds it. Per the
+standing rule -- new gaps get fixed, not documented
+away -- this was added rather than silently dropping
+the override flag on the floor.
+
+**Do not remove the facility lookup or signature
+check to "simplify" this endpoint. That is Gap 2,
+reopened.**
