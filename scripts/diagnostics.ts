@@ -1,7 +1,11 @@
 import { getSystemStatus } from '../src/status.js';
 import { pingResolver } from '../src/resolver-client.js';
 import { cacheStats, isDbFileEncrypted } from '../src/cache.js';
+import { getMigrationOutcome } from '../src/keystore-migration.js';
 
+// getSystemStatus() -> getKeyStorageStatus() -> locateFacilityKey() is what
+// actually attempts the legacy-keytar migration (as a last resort, Windows
+// only) -- so the outcome is only known once this call below has run.
 const status = await getSystemStatus();
 const resolverReachability = await pingResolver();
 
@@ -32,11 +36,17 @@ if (status.keys.storage === 'file') {
 } else if (status.keys.storage === 'missing') {
   console.error('ERROR: No facility private key found.');
 }
+if (getMigrationOutcome() === 'migrated') {
+  console.log('Migrated facility key from legacy keytar store to current keyring store (this run).');
+} else if (getMigrationOutcome() === 'verify_failed') {
+  console.error('ERROR: Found a legacy keytar credential but migration verification failed -- the legacy credential was left in place. See the error above.');
+}
 console.log('');
 
 const report = {
   timestamp: new Date().toISOString(),
   ...status,
+  keytarMigration: getMigrationOutcome(),
   resolver: {
     ...status.resolver,
     reachable: resolverReachability.ok,

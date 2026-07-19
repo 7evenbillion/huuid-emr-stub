@@ -36,19 +36,78 @@ Credential Manager set/get/delete roundtrip, and its API is synchronous
 functions stay `async` regardless, purely so every existing caller's
 `await` keeps working unchanged.
 
-**Real finding, not a prebuild problem: the two libraries are not
-Credential-Manager-interoperable.** keytar stores under Windows target
+**Real finding, not a prebuild problem: the two libraries were not
+Credential-Manager-interoperable.** keytar stored under Windows target
 `huuid-emr-stub/facility-private-key` (service/account); `@napi-rs/keyring`
 stores under `facility-private-key.huuid-emr-stub` (account.service) --
-different strings, same underlying store, mutually invisible. A facility
-that already ran the keytar-based `secure-keys` has its PEM already
-shredded and its key now orphaned under the old target name after this
-dependency swap. This build's own test key hit exactly that: recovered
-here only because the resolver's test-facility fixture could regenerate a
-fresh PEM; a real facility key has no such backup. **If this swap is
-deployed to any facility that already ran the old `secure-keys`, that
-facility's key must be recovered before upgrading** -- there is no
-automatic migration path in this codebase, and none should be assumed.
+different strings, same underlying store, mutually invisible. This was
+originally a real operational gap: a facility that had already run the
+keytar-based `secure-keys` had its PEM already shredded, leaving its key
+orphaned under the old target name after the dependency swap, with no
+plaintext backup. **This is now fixed automatically -- see "Upgrading from
+keytar-based installations" below.**
+
+### Upgrading from keytar-based installations (v0.x before July 2026)
+
+Migration is automatic on first startup after upgrading. No manual steps
+required.
+
+`src/keystore-migration.ts` runs as the last-resort step in the same
+lookup chain `facility-key.ts` already used (current keystore -> PEM file
+-> *then* legacy keytar, Windows only) -- so it only ever runs for a
+facility that has neither a current-format keystore entry nor a PEM file,
+which is exactly the state a keytar-upgraded facility is in (its PEM was
+already shredded by the old `secure-keys`). On every other startup it is
+never reached at all.
+
+**How it actually reads the legacy credential -- and why not the obvious
+way.** `@napi-rs/keyring` ships `Entry.withTarget(target, service, account)`,
+which looked like the natural fix: point it at keytar's exact target string
+and read the key without any extra dependency. Tested against a real
+keytar-written credential, it returned an empty string. Tested again as a
+*pure self-consistency* check -- writing with `withTarget` and reading back
+with `withTarget`, no keytar involved at all -- it *still* returned an
+empty string. That ruled it out as a bug in the npm package on Windows,
+not a target-string mismatch, before it was built on.
+
+The actual mechanism: raw P/Invoke to `advapi32.dll`'s `CredRead` /
+`CredDelete` via PowerShell's `Add-Type` -- the same underlying Win32 API
+keytar's native addon and `@napi-rs/keyring`'s Rust backend both call
+internally, invoked directly rather than through either npm package.
+`Get-StoredCredential` (the other tool named for this) also doesn't work
+out of the box -- it isn't a built-in cmdlet, it ships in the third-party
+`CredentialManager` PowerShell module, which isn't installed by default
+and installing it wasn't assumed. `Add-Type`/P/Invoke requires no module
+install; it ships with every Windows PowerShell.
+
+One more thing verified rather than assumed: the `CredentialBlob` decode.
+The "correct" Windows-native assumption is UTF-16LE. Decoding a real
+keytar-written credential that way produced garbage. keytar's Windows
+addon writes the password as raw UTF-8 bytes instead -- confirmed by
+switching the decode to UTF-8 and getting a byte-for-byte match against
+the known original value. `src/keystore-migration.ts` decodes as UTF-8
+for exactly this reason.
+
+Migration sequence, matching the spec's steps exactly: read the legacy
+credential -> write it to the current keystore -> read it back and verify
+the value matches -> only then delete the legacy credential. If
+verification fails, the legacy credential is left in place and nothing is
+deleted -- `npm run diagnostics` reports this as an error rather than
+silently losing the key. Every failure mode (PowerShell unavailable, call
+times out, nothing to migrate) returns `null` and falls through to the
+normal "no key found" handling; migration never crashes startup.
+
+`npm run diagnostics` reports `Migrated facility key from legacy keytar
+store to current keyring store (this run)` when it (or `npm run start`)
+is the one that triggers the migration, and includes `"keytarMigration":
+"migrated"` in its JSON output. On any later run, once the key is already
+in the current keystore, this step is skipped entirely and nothing is
+reported.
+
+**Scope note:** this migration path is Windows-only, matching the target
+strings actually verified against a real keytar-written credential. macOS
+Keychain and Linux libsecret were not observed to have the same
+interoperability gap during this build and are out of scope here.
 
 ### Where the facility private key actually lives now
 

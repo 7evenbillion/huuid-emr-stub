@@ -2,6 +2,7 @@ import { Entry } from '@napi-rs/keyring';
 import { readFileSync, existsSync } from 'node:fs';
 import { createPrivateKey, type KeyObject } from 'node:crypto';
 import { loadConfig } from './config.js';
+import { attemptKeytarMigration } from './keystore-migration.js';
 
 export const KEYRING_SERVICE = 'huuid-emr-stub';
 export const KEYRING_ACCOUNT = 'facility-private-key';
@@ -51,25 +52,27 @@ export function buildEd25519KeyObjectFromRaw(rawBytes: Buffer): KeyObject {
   }
 }
 
+type LocatedKey = { bytes: Buffer; source: 'keystore' | 'file' } | null;
+
 /**
- * Keystore-first, file-fallback (Step 3/4) -- lets the system keep working
- * during the transition period before `npm run secure-keys` has been run.
- * Throws with a clear message if neither source has a key.
+ * Keystore -> file -> (Windows only) legacy-keytar migration, in that
+ * order -- the single lookup chain both getFacilityPrivateKeyRaw() and
+ * getKeyStorageStatus() build on, so the two functions can never disagree
+ * about where the key is. The migration attempt is deliberately the LAST
+ * resort, right before giving up: it is only reached when neither the
+ * current keystore nor the file has a key, so a facility that has already
+ * migrated (or never used keytar) never pays for a PowerShell spawn.
  *
  * MEMORY NOTE (Step 7): the caller owns zeroing the returned `bytes` buffer
- * immediately after use. This function cannot also zero the base64url
- * string Entry.getPassword() returns (or the PEM string read from file) --
- * JS strings are immutable, so nothing can zero their backing memory from
- * JS code. Buffers are the only representation that can actually be wiped;
- * keeping the string-typed intermediates as short-lived and few as possible
- * is the practical mitigation here, not a claim of true secure erasure.
- *
- * Kept `async` even though @napi-rs/keyring's API is synchronous (unlike
- * keytar's) -- every caller of this function already `await`s it, and
- * keeping the same Promise-returning signature means this swap touches
- * nothing outside facility-key.ts and secure-keys.ts.
+ * immediately after use. This cannot also zero the base64url string
+ * Entry.getPassword() returns (or the PEM string read from file) -- JS
+ * strings are immutable, so nothing can zero their backing memory from JS
+ * code. Buffers are the only representation that can actually be wiped;
+ * keeping the string-typed intermediates as short-lived and few as
+ * possible is the practical mitigation here, not a claim of true secure
+ * erasure.
  */
-export async function getFacilityPrivateKeyRaw(): Promise<{ bytes: Buffer; source: 'keystore' | 'file' }> {
+async function locateFacilityKey(): Promise<LocatedKey> {
   const fromKeystore = keyringEntry().getPassword();
   if (fromKeystore) {
     return { bytes: Buffer.from(fromKeystore, 'base64url'), source: 'keystore' };
@@ -81,16 +84,37 @@ export async function getFacilityPrivateKeyRaw(): Promise<{ bytes: Buffer; sourc
     return { bytes: rawKeyFromPem(pem), source: 'file' };
   }
 
+  if (process.platform === 'win32') {
+    const migrated = await attemptKeytarMigration();
+    if (migrated) {
+      return { bytes: migrated.bytes, source: 'keystore' };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Kept `async` even though @napi-rs/keyring's API is synchronous (unlike
+ * keytar's) -- every caller of this function already `await`s it, and
+ * keeping the same Promise-returning signature means the keytar swap and
+ * this migration both stay contained to this module.
+ */
+export async function getFacilityPrivateKeyRaw(): Promise<{ bytes: Buffer; source: 'keystore' | 'file' }> {
+  const located = await locateFacilityKey();
+  if (located) return located;
+
   throw new Error(
-    'No facility private key found in the OS keystore or at HUUID_FACILITY_PRIVATE_KEY_PATH. ' +
-      'Place a PKCS8 PEM Ed25519 key at that path (see README), then optionally run npm run secure-keys.'
+    'No facility private key found in the OS keystore, at HUUID_FACILITY_PRIVATE_KEY_PATH, or (Windows) ' +
+      'in a legacy keytar credential. Place a PKCS8 PEM Ed25519 key at that path (see README), then ' +
+      'optionally run npm run secure-keys.'
   );
 }
 
-/** For diagnostics/health -- reports where the key currently lives without building a signing key. */
+/** For diagnostics/health -- reports where the key currently lives without holding onto the raw bytes. */
 export async function getKeyStorageStatus(): Promise<KeyStorageStatus> {
-  const fromKeystore = keyringEntry().getPassword();
-  if (fromKeystore) return 'keystore';
-  const config = loadConfig();
-  return existsSync(config.HUUID_FACILITY_PRIVATE_KEY_PATH) ? 'file' : 'missing';
+  const located = await locateFacilityKey();
+  if (!located) return 'missing';
+  located.bytes.fill(0); // this call only needs to know *where* the key is, not the key itself
+  return located.source;
 }
