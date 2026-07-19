@@ -2,6 +2,14 @@ import { getSystemStatus } from '../src/status.js';
 import { pingResolver } from '../src/resolver-client.js';
 import { cacheStats, isDbFileEncrypted } from '../src/cache.js';
 import { getMigrationOutcome } from '../src/keystore-migration.js';
+import { runIntegrityCheck } from '../src/integrity-check.js';
+
+// diagnostics.ts runs as its own one-shot process, separate from any
+// running `npm run start` -- integrity-check.ts's last-check state is only
+// in-memory, so without running the check here, a standalone diagnostics
+// run would always report "not_checked" regardless of what the actual
+// running server last saw. Run it fresh, same as the resolver ping below.
+await runIntegrityCheck();
 
 // getSystemStatus() -> getKeyStorageStatus() -> locateFacilityKey() is what
 // actually attempts the legacy-keytar migration (as a last resort, Windows
@@ -43,6 +51,16 @@ if (getMigrationOutcome() === 'migrated') {
 }
 console.log('');
 
+// This step's Step 5 verification.
+console.log(`Integrity baseline: ${status.integrity.baselineExists ? 'EXISTS' : 'MISSING'}`);
+if (!status.integrity.baselineExists) {
+  console.warn('WARNING: Run npm run install-integrity-baseline.');
+}
+const lastCheckLabel = { pass: 'PASS', fail: 'FAIL', not_checked: 'NOT RUN' }[status.integrity.lastCheckStatus];
+console.log(`Last integrity check: ${lastCheckLabel}`);
+console.log(`Integrity check interval: ${status.integrity.checkIntervalHours} hours`);
+console.log('');
+
 const report = {
   timestamp: new Date().toISOString(),
   ...status,
@@ -52,10 +70,7 @@ const report = {
     reachable: resolverReachability.ok,
     detail: resolverReachability.detail,
   },
-  hardeningNotStarted: [
-    'Integrity baseline / HMAC monitoring (P4)',
-    'QR card offline verification (resolution tier 4)',
-  ],
+  hardeningNotStarted: ['QR card offline verification (resolution tier 4)'],
 };
 
 console.log(JSON.stringify(report, null, 2));

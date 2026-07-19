@@ -5,6 +5,7 @@ import { localAuthMiddleware } from './local-auth.js';
 import { verifyPatient, type PurposeCode } from './verify-patient.js';
 import { getSystemStatus } from './status.js';
 import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
+import { runIntegrityCheck } from './integrity-check.js';
 
 const config = loadConfig();
 
@@ -18,6 +19,18 @@ try {
   console.error(`Cache initialization failed: ${err instanceof Error ? err.message : 'unknown error'}`);
   process.exit(1);
 }
+
+// Integrity check at startup -- deliberately does NOT block/exit on a
+// violation (see integrity-check.ts's doc comment for why). Re-run every 6
+// hours per Step 3 while the server is running; /health and diagnostics
+// report whichever run (startup or scheduled) happened most recently rather
+// than recomputing on every request, matching status.ts's "local-only, no
+// expensive recomputation" design.
+await runIntegrityCheck();
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+setInterval(() => {
+  void runIntegrityCheck();
+}, SIX_HOURS_MS);
 
 const app = express();
 app.use(express.json());
@@ -35,11 +48,14 @@ app.get('/health', async (_req: Request, res: Response) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     ...status,
-    // Flat fields per the SQLCipher step's Step 6 and this step's Step 6,
-    // alongside the nested objects above (which already carry the same info).
+    // Flat fields per the SQLCipher step's Step 6, the keystore step's Step
+    // 6, and this step's Step 6, alongside the nested objects above (which
+    // already carry the same info).
     cache_encrypted: status.cache.encrypted,
     cache_entries: status.cache.totalEntries,
     key_storage: status.keys.storage,
+    integrity_baseline: status.integrity.baselineExists,
+    integrity_status: status.integrity.lastCheckStatus,
   });
 });
 

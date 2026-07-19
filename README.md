@@ -11,19 +11,22 @@ the Next.js resolver (`huuid-resolver`). It runs locally at each clinic.
 ## Status
 
 **Base build + Security Layer 1 (SQLCipher, P1) + Security Layer 2 (OS
-keystore, P2).** The local cache DB is AES-256-CBC + HMAC-SHA512 encrypted
-(SQLCipher's real cipher -- not GCM, see below), keyed by HKDF-SHA256 over
-the facility private key. The facility private key itself now lives in the
-OS credential store (Windows Credential Manager / macOS Keychain / Linux
-libsecret via `@napi-rs/keyring`) once `npm run secure-keys` has been run --
-the PEM file is shredded and deleted at that point. A file fallback remains
-for the transition period before that script has been run. **Explicitly not
-implemented yet** (by design, one layer at a time):
+keystore, P2) + Security Layer 3 (process integrity hashing, P4).** The
+local cache DB is AES-256-CBC + HMAC-SHA512 encrypted (SQLCipher's real
+cipher -- not GCM, see below), keyed by HKDF-SHA256 over the facility
+private key. The facility private key itself lives in the OS credential
+store (Windows Credential Manager / macOS Keychain / Linux libsecret via
+`@napi-rs/keyring`) once `npm run secure-keys` has been run -- the PEM
+file is shredded and deleted at that point. A file fallback remains for
+the transition period before that script has been run. `npm run
+install-integrity-baseline` signs a manifest of every `src/`/`scripts/`
+file (plus `package-lock.json`) with the facility key; `npm run start`
+verifies it on every startup and every 6 hours thereafter. **Explicitly
+not implemented yet** (by design, one layer at a time):
 
-- Integrity baseline / HMAC monitoring (P4)
 - QR card offline verification (resolution tier 4)
 
-`npm run diagnostics` reports both honestly as not-yet-started.
+`npm run diagnostics` reports this honestly as not-yet-started.
 
 ### `keytar` replaced with `@napi-rs/keyring`
 
@@ -163,6 +166,70 @@ passphrase-based key derivation. This Stub supplies a raw, pre-derived key
 bypasses that KDF step entirely. Set anyway for spec fidelity -- it does
 not weaken or strengthen anything here.
 
+### Process integrity hashing (P4)
+
+`npm run install-integrity-baseline` computes a single HMAC-SHA256 over
+every `.ts`/`.js` file in `src/` and `scripts/` plus `package-lock.json`
+(sorted by path, path and content both hashed so a rename or a swap
+between two same-sized files is caught, not just an edit), EdDSA-signs
+that hash with the facility private key, and writes `integrity/
+baseline.hmac` read-only (`attrib +r` on Windows, `chmod 444` elsewhere).
+`npm run start` recomputes and verifies the same manifest on every
+startup and every 6 hours thereafter (`src/integrity-check.ts`).
+
+**Deferred by design, not by oversight: a mismatch does NOT stop the
+Stub from starting.** The doc says a mismatch should refuse to start.
+This build deliberately doesn't do that yet -- refusing to start on any
+manifest mismatch risks bricking a clinic machine over a stale baseline
+(e.g. a legitimate `npm update` that wasn't followed by re-running
+`install-integrity-baseline`), which is a worse outcome for patient care
+than a facility running while flagged. The alert to the Root Authority
+(`POST /1.0/stub-integrity` on the resolver) is the load-bearing piece
+for now; `integrityViolation` is tracked and surfaced via `/health` and
+`npm run diagnostics`, but the server keeps running.
+
+**Real gotcha, not a bug: `git checkout`/`git pull` on Windows can trip a
+false-positive violation.** Found while testing the tamper-then-restore
+flow -- restoring a file via `git checkout` produced a byte-different
+file (CRLF line endings, from Windows' `core.autocrlf`) even though the
+text content was identical to what the baseline was computed from (LF).
+The manifest hashes raw bytes, so it correctly flagged this as changed --
+which is the check working as designed, but it means **re-running `npm
+run install-integrity-baseline` after any `git pull` that could have
+touched line endings is a real operational step**, not just after
+intentional code edits. Worth knowing before this trips someone up in a
+real deployment.
+
+**HMAC key is HKDF-derived, domain-separated from the cache encryption
+key.** Same root secret (facility private key), different salt/info
+strings (`:integrity-baseline-v1` / `huuid-integrity-key` vs.
+cache-key.ts's `:cache-encryption-v1` / `huuid-cache-key`), so a leak or
+reuse of one derived key says nothing about the other. Not strictly
+load-bearing for tamper-*detection* -- the EdDSA signature over the
+manifest hash is what actually prevents forgery -- but it keeps the raw
+manifest fingerprint tied to a specific facility rather than being a
+plain, publicly comparable hash.
+
+**Self-verification, not a fetch.** `verifyManifestSignature` checks the
+baseline's signature against a public key derived from the SAME private
+key bytes this process already holds (Ed25519 public keys are always
+deterministically derivable from the private seed -- see
+`buildEd25519KeyObjectFromRaw` in `facility-key.ts`), not against
+`huuid_facilities.public_key_multibase` on the resolver. This answers
+"did *this* Stub's own key sign this baseline," which is what startup
+tamper-detection needs; it is not a claim that some other party has
+independently attested to the key's legitimacy.
+
+**Resolver side: the alert endpoint doesn't verify the signature yet.**
+`POST /1.0/stub-integrity` (in the `huuid-resolver` repo) accepts, logs
+to `huuid_stub_integrity_log`, and returns 200 -- deliberately minimal,
+matching this step's scope. It does NOT check the payload's `signature`
+against the reporting facility's public key before writing the row. "No
+auth required because it's signed" is only true once something actually
+checks the signature; until then, treat this table as a diagnostic log
+of self-reported claims, not a verified audit trail. Flagged in both the
+route and its migration file, not silently treated as trusted.
+
 ## Setup
 
 ```
@@ -218,12 +285,15 @@ npm run start
 | `install-systemd` (Linux) | Implemented -- generates a unit file + prints `systemctl` commands; does not self-install |
 | `download-keys` | Not implemented -- no live endpoint yet |
 | `secure-keys` | Implemented -- imports the facility key to the OS keystore, verifies the roundtrip, then shreds + deletes the PEM. Halts without deleting anything if verification fails. |
-| `install-integrity-baseline` | Not implemented -- deferred (HMAC monitoring) |
+| `install-integrity-baseline` | Implemented -- signs a manifest of `src/`/`scripts/`/`package-lock.json` with the facility key, writes it read-only. Warns and asks for confirmation before overwriting an existing baseline. |
 
 `npm run diagnostics` also verifies cache encryption is active (checks the
-DB file lacks SQLite's plaintext magic header) and reports `Cache: ENCRYPTED`,
-and reports `Key storage: KEYSTORE / FILE / MISSING` with a warning or error
-as appropriate.
+DB file lacks SQLite's plaintext magic header) and reports `Cache: ENCRYPTED`;
+reports `Key storage: KEYSTORE / FILE / MISSING` with a warning or error as
+appropriate; and reports `Integrity baseline: EXISTS/MISSING`, `Last
+integrity check: PASS/FAIL/NOT RUN`, and the 6-hour check interval (running
+its own fresh integrity check first, since it's a separate process from any
+running `npm run start` and has no other way to know the current state).
 
 **Note on `scripts/secure-keys.ts`'s location:** this build step's brief
 named `src/scripts/secure-keys.ts` as the file path. The repo's established

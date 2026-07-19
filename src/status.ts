@@ -2,6 +2,9 @@ import { loadConfig } from './config.js';
 import { cacheStats, isDbFileEncrypted } from './cache.js';
 import { localAuthDiagnostics } from './local-auth.js';
 import { getKeyStorageStatus } from './facility-key.js';
+import { hasBaseline, getLastCheckStatus } from './integrity-check.js';
+
+const INTEGRITY_CHECK_INTERVAL_HOURS = 6;
 
 /**
  * Local-only status (no network calls) -- used by GET /health and
@@ -27,7 +30,9 @@ export async function getSystemStatus() {
       storage: keyStorage, // 'keystore' | 'file' | 'missing'
     },
     integrity: {
-      monitored: false, // HMAC baseline (P4) not built yet -- explicitly deferred this step
+      baselineExists: hasBaseline(),
+      lastCheckStatus: getLastCheckStatus(), // 'pass' | 'fail' | 'not_checked'
+      checkIntervalHours: INTEGRITY_CHECK_INTERVAL_HOURS,
     },
     auth: {
       secretConfigured: auth.secretConfigured,

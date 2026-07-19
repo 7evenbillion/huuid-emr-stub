@@ -139,3 +139,95 @@ directly, bypassing that step entirely.
 Fidelity to the spec. Harmless. Removing it would
 require explaining why it was removed, which is
 more confusing than leaving it with this comment.
+
+---
+
+## 7. Baseline read-only: attrib +r, not icacls /deny
+
+**Decision:** Windows read-only uses the classic file
+ATTRIBUTE (`attrib +r`), not an NTFS ACL deny.
+
+**Why not icacls /deny Everyone:W:**
+Literally what the spec named. Tested first. It
+blocks READS too, not just writes -- Node's
+readFileSync failed with EPERM even though the ACL
+only listed a write deny. That would have broken
+integrity-check.ts, which must read baseline.hmac on
+every startup. Confirmed by testing, not assumed.
+
+**Why attrib +r:**
+The standard Windows equivalent of chmod 444. Tested:
+blocks writes, leaves reads fully intact. `attrib -r`
+cleanly restores full access for legitimate baseline
+updates (Step 1.7's overwrite-with-confirmation flow).
+
+**Do not switch this to an icacls deny approach.**
+
+---
+
+## 8. Integrity manifest key: HKDF-derived, not a fixed/public key
+
+**Decision:** The HMAC-SHA256 manifest key is derived
+via HKDF-SHA256 over the facility private key, salt
+`{facilityDid}:integrity-baseline-v1`, info
+`huuid-integrity-key` -- domain-separated from the
+cache encryption key (P1), which uses a different
+salt/info pair from the same root secret.
+
+**Why this isn't strictly load-bearing:**
+The manifest's real tamper-evidence comes from the
+EdDSA signature over the hash (facility private key,
+Ed25519), not from the HMAC key being secret. An
+attacker who modifies files can recompute a new
+manifest hash with any key; what they cannot do is
+produce a valid EdDSA signature over it.
+
+**Why it's kept anyway:**
+Ties the raw manifest fingerprint to a specific
+facility rather than leaving it a plain, universally
+comparable SHA-256. Reuses the same HKDF-from-facility-
+key pattern already established for the cache key,
+rather than introducing a new key-management approach
+for one feature.
+
+---
+
+## 9. Startup tamper check does not refuse to start
+
+**Decision:** An integrity violation is logged and
+alerted, but the Stub still starts. Deferred from the
+spec's "refuse to start if tampered."
+
+**Why:**
+Refusing to start on any manifest mismatch risks
+bricking a clinic machine over a stale baseline (e.g.
+a legitimate npm update not followed by re-running
+install-integrity-baseline) -- a worse outcome for
+patient care than running while flagged. The alert to
+the Root Authority is the load-bearing piece for this
+step; `integrityViolation` is tracked and surfaced via
+/health and diagnostics.
+
+**Real gotcha found while testing this:** `git
+checkout`/`git pull` on Windows can trip a
+false-positive violation. Restoring a file via `git
+checkout` produced CRLF line endings (Windows'
+core.autocrlf) even though the text was identical to
+what the baseline was computed from (LF) -- a
+byte-different file the manifest correctly flagged as
+changed. Re-running install-integrity-baseline after
+any git pull that could touch line endings is a real
+operational step, not just after intentional edits.
+
+**Resolver-side gap, not yet closed:** POST
+/1.0/stub-integrity accepts, logs, and returns 200 but
+does not verify the payload's signature against the
+reporting facility's public key before writing the
+row. Treat huuid_stub_integrity_log as a diagnostic
+log of self-reported claims for this step, not a
+verified audit trail.
+
+**Do not change either the no-refuse-to-start
+behavior or the resolver's accept-without-verify
+behavior without addressing both flagged gaps above
+first.**
