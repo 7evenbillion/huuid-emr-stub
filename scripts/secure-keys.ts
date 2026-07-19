@@ -1,8 +1,10 @@
-import keytar from 'keytar';
+import { Entry } from '@napi-rs/keyring';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { loadConfig } from '../src/config.js';
-import { rawKeyFromPem, KEYTAR_SERVICE, KEYTAR_ACCOUNT } from '../src/facility-key.js';
+import { rawKeyFromPem, KEYRING_SERVICE, KEYRING_ACCOUNT } from '../src/facility-key.js';
+
+const entry = new Entry(KEYRING_SERVICE, KEYRING_ACCOUNT);
 
 const config = loadConfig();
 const pemPath = config.HUUID_FACILITY_PRIVATE_KEY_PATH;
@@ -24,10 +26,10 @@ try {
 
 // Step 2: store in the OS keystore.
 const encoded = rawBytes.toString('base64url');
-await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT, encoded);
+entry.setPassword(encoded);
 
 // Step 3: retrieve immediately to verify storage worked.
-const retrieved = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT);
+const retrieved = entry.getPassword();
 
 const matches =
   retrieved !== null &&

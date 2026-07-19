@@ -15,9 +15,9 @@ keystore, P2).** The local cache DB is AES-256-CBC + HMAC-SHA512 encrypted
 (SQLCipher's real cipher -- not GCM, see below), keyed by HKDF-SHA256 over
 the facility private key. The facility private key itself now lives in the
 OS credential store (Windows Credential Manager / macOS Keychain / Linux
-libsecret via `keytar`) once `npm run secure-keys` has been run -- the PEM
-file is shredded and deleted at that point. A file fallback remains for the
-transition period before that script has been run. **Explicitly not
+libsecret via `@napi-rs/keyring`) once `npm run secure-keys` has been run --
+the PEM file is shredded and deleted at that point. A file fallback remains
+for the transition period before that script has been run. **Explicitly not
 implemented yet** (by design, one layer at a time):
 
 - Integrity baseline / HMAC monitoring (P4)
@@ -25,15 +25,30 @@ implemented yet** (by design, one layer at a time):
 
 `npm run diagnostics` reports both honestly as not-yet-started.
 
-### `keytar` is unmaintained upstream
+### `keytar` replaced with `@napi-rs/keyring`
 
-Flagged, not hidden: `keytar`'s last release was over a year ago and its
-GitHub repo has been archived. It was the package this build step named,
-and it does work correctly here (verified: install, load, and a full
-Windows Credential Manager set/get/delete roundtrip all succeed). Worth
-knowing before relying on it long-term, unlike the SQLCipher package swap
-last step, this wasn't a functional blocker so it wasn't treated as one --
-just a maintenance-risk note for whoever revisits this dependency.
+`keytar` (used for the initial P2 build) is unmaintained upstream -- last
+release over a year ago, GitHub repo archived. `@napi-rs/keyring` is its
+actively maintained replacement: verified here with a real Windows prebuild
+(`@napi-rs/keyring-win32-x64-msvc`, N-API so ABI-stable), a full Windows
+Credential Manager set/get/delete roundtrip, and its API is synchronous
+(unlike keytar's Promise-based one) -- `facility-key.ts`'s exported
+functions stay `async` regardless, purely so every existing caller's
+`await` keeps working unchanged.
+
+**Real finding, not a prebuild problem: the two libraries are not
+Credential-Manager-interoperable.** keytar stores under Windows target
+`huuid-emr-stub/facility-private-key` (service/account); `@napi-rs/keyring`
+stores under `facility-private-key.huuid-emr-stub` (account.service) --
+different strings, same underlying store, mutually invisible. A facility
+that already ran the keytar-based `secure-keys` has its PEM already
+shredded and its key now orphaned under the old target name after this
+dependency swap. This build's own test key hit exactly that: recovered
+here only because the resolver's test-facility fixture could regenerate a
+fresh PEM; a real facility key has no such backup. **If this swap is
+deployed to any facility that already ran the old `secure-keys`, that
+facility's key must be recovered before upgrading** -- there is no
+automatic migration path in this codebase, and none should be assumed.
 
 ### Where the facility private key actually lives now
 
@@ -55,7 +70,7 @@ worth knowing:
   `scripts/secure-keys.ts`). `resolver-client.ts` no longer caches a signing
   key across requests -- it fetches raw bytes, builds a key, signs, and
   zeroes on every single call, per this step's literal wording. What
-  *cannot* be zeroed: the base64url string `keytar.getPassword()` returns,
+  *cannot* be zeroed: the base64url string `Entry.getPassword()` returns,
   or a PEM string, since JS strings are immutable and nothing can wipe their
   backing memory from JS code. This is a real limit of the runtime, not an
   oversight -- documented rather than glossed over.

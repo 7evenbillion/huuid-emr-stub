@@ -1,10 +1,14 @@
-import keytar from 'keytar';
+import { Entry } from '@napi-rs/keyring';
 import { readFileSync, existsSync } from 'node:fs';
 import { createPrivateKey, type KeyObject } from 'node:crypto';
 import { loadConfig } from './config.js';
 
-export const KEYTAR_SERVICE = 'huuid-emr-stub';
-export const KEYTAR_ACCOUNT = 'facility-private-key';
+export const KEYRING_SERVICE = 'huuid-emr-stub';
+export const KEYRING_ACCOUNT = 'facility-private-key';
+
+function keyringEntry(): Entry {
+  return new Entry(KEYRING_SERVICE, KEYRING_ACCOUNT);
+}
 
 export type KeyStorageStatus = 'keystore' | 'file' | 'missing';
 
@@ -54,14 +58,19 @@ export function buildEd25519KeyObjectFromRaw(rawBytes: Buffer): KeyObject {
  *
  * MEMORY NOTE (Step 7): the caller owns zeroing the returned `bytes` buffer
  * immediately after use. This function cannot also zero the base64url
- * string keytar.getPassword() returns (or the PEM string read from file) --
+ * string Entry.getPassword() returns (or the PEM string read from file) --
  * JS strings are immutable, so nothing can zero their backing memory from
  * JS code. Buffers are the only representation that can actually be wiped;
  * keeping the string-typed intermediates as short-lived and few as possible
  * is the practical mitigation here, not a claim of true secure erasure.
+ *
+ * Kept `async` even though @napi-rs/keyring's API is synchronous (unlike
+ * keytar's) -- every caller of this function already `await`s it, and
+ * keeping the same Promise-returning signature means this swap touches
+ * nothing outside facility-key.ts and secure-keys.ts.
  */
 export async function getFacilityPrivateKeyRaw(): Promise<{ bytes: Buffer; source: 'keystore' | 'file' }> {
-  const fromKeystore = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT);
+  const fromKeystore = keyringEntry().getPassword();
   if (fromKeystore) {
     return { bytes: Buffer.from(fromKeystore, 'base64url'), source: 'keystore' };
   }
@@ -80,7 +89,7 @@ export async function getFacilityPrivateKeyRaw(): Promise<{ bytes: Buffer; sourc
 
 /** For diagnostics/health -- reports where the key currently lives without building a signing key. */
 export async function getKeyStorageStatus(): Promise<KeyStorageStatus> {
-  const fromKeystore = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT);
+  const fromKeystore = keyringEntry().getPassword();
   if (fromKeystore) return 'keystore';
   const config = loadConfig();
   return existsSync(config.HUUID_FACILITY_PRIVATE_KEY_PATH) ? 'file' : 'missing';
