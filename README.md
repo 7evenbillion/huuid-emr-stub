@@ -195,7 +195,12 @@ observing an external env change mid-countdown), so a genuine attacker
 who doesn't know to set it is locked out; a false positive (the CRLF
 gotcha below, or a legitimate update) is a documented IT-technician
 recovery path; a real emergency lets a clinician override and keep
-treating the patient while the Root Authority is alerted either way.
+treating the patient either way. **Not yet true: that the Root Authority
+is "alerted."** Every violation and override is signed and written to the
+resolver's `huuid_stub_integrity_log` (verified, immutable as of Gap 2 +
+the immutability trigger), but nothing emails or pages a human today --
+the row just sits there until someone queries it. Tracked as an open
+pre-pilot gap, not glossed over as "alerting."
 **Scoped to startup only** -- the 6-hour periodic recheck still uses the
 original soft-fail behavior (log + alert + keep running); forcibly
 killing a server that's been running fine and serving patients for hours
