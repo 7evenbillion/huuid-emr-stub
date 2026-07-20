@@ -2,10 +2,18 @@ import express, { type Request, type Response } from 'express';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { localAuthMiddleware } from './local-auth.js';
-import { verifyPatient, type PurposeCode } from './verify-patient.js';
+import { verifyPatient, recordQRVerification, type PurposeCode } from './verify-patient.js';
 import { getSystemStatus } from './status.js';
 import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
 import { runIntegrityCheck, enforceStartupIntegrity } from './integrity-check.js';
+import { verifyQRToken } from './qr-verifier.js';
+import {
+  loadResolverPublicKeyAtStartup,
+  getResolverPublicKeyBytes,
+  getResolverKeyId,
+  getQRVerificationStatus,
+} from './resolver-key.js';
+import { recordQRVerificationAttempt, getRecentQRVerifications } from './qr-verification-log.js';
 
 const config = loadConfig();
 
@@ -34,12 +42,23 @@ setInterval(() => {
   void runIntegrityCheck();
 }, SIX_HOURS_MS);
 
+// QR verification (tier 4 offline fallback), Step 6. Best-effort and
+// non-fatal by design -- this is a fallback tier, not a core requirement
+// (HUUID-EMR-STUB-v0.1.2.docx Section 3.1). A missing or unreadable key
+// leaves qr_verification as 'no_key'/'error' (surfaced on /health and
+// diagnostics) but does not stop the Stub from serving tiers 1-3.
+loadResolverPublicKeyAtStartup();
+
 const app = express();
 app.use(express.json());
 
 const verifyBodySchema = z.object({
   localPatientId: z.string().min(1),
   purposeCode: z.enum(['Treatment', 'Administrative', 'Emergency']),
+});
+
+const qrVerifyBodySchema = z.object({
+  payload: z.string().min(1),
 });
 
 // GET /health -- system status. Deliberately unauthenticated, matching the
@@ -59,6 +78,8 @@ app.get('/health', async (_req: Request, res: Response) => {
     integrity_baseline: status.integrity.baselineExists,
     integrity_status: status.integrity.lastCheckStatus,
     integrity_override_active: status.integrity.overrideActive,
+    qr_verification: getQRVerificationStatus(),
+    resolver_public_key_cached: getResolverPublicKeyBytes() !== null,
     // Gap 1 closure: printed on every /health response while override is
     // active, not just logged once at startup -- so anyone polling health
     // (a dashboard, a human curling it) sees the facility is running in a
@@ -86,6 +107,78 @@ app.post('/verify', localAuthMiddleware, async (req: Request, res: Response) => 
   res.status(200).json(result);
 });
 
+// POST /qr/verify -- resolution tier 4 (offline QR card fallback), Step 4.
+// Requires X-Local-Auth like /verify. Fully offline: no resolver call, no
+// dependency on connectivity -- this is the whole point of the tier.
+app.post('/qr/verify', localAuthMiddleware, async (req: Request, res: Response) => {
+  const parsed = qrVerifyBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: 'invalid_request', message: parsed.error.message });
+    return;
+  }
+
+  const keyBytes = getResolverPublicKeyBytes();
+  if (!keyBytes) {
+    res.status(503).json({
+      valid: false,
+      expired: false,
+      warning: null,
+      huuid: null,
+      bloodType: null,
+      criticalAllergies: [],
+      expiresAt: null,
+      source: 'qr_card',
+      error: 'QR verification unavailable: no resolver public key cached. Run npm run download-keys.',
+    });
+    return;
+  }
+
+  const result = verifyQRToken(parsed.data.payload, keyBytes);
+  recordQRVerificationAttempt(result);
+
+  if (!result.valid) {
+    // Do not return any health data on an invalid signature (Step 4).
+    res.status(400).json({
+      valid: false,
+      expired: false,
+      warning: null,
+      huuid: null,
+      bloodType: null,
+      criticalAllergies: [],
+      expiresAt: null,
+      source: 'qr_card',
+      error: result.error,
+    });
+    return;
+  }
+
+  // Cache key: the QR token's own huuid, not a separate EMR-local-patient-ID
+  // -- the request body per spec carries only the token payload, no
+  // localPatientId. This matches verify-patient.ts's already-documented gap
+  // (localPatientId is currently just the did:huuid passed straight through,
+  // there being no separate local-MRN-to-HUUID linkage mechanism yet) rather
+  // than introducing a new, different simplification for this one path.
+  await recordQRVerification(result.huuid as string, {
+    huuid: result.huuid as string,
+    bloodType: result.bloodType,
+    criticalAllergies: result.criticalAllergies,
+    expiresAtSeconds: result.expiresAt ? Math.floor(result.expiresAt.getTime() / 1000) : Math.floor(Date.now() / 1000),
+  });
+
+  res.status(200).json({
+    valid: true,
+    expired: result.expired,
+    warning: result.expired
+      ? 'Token expired. Data shown for emergency reference only. Verify with resolver when connectivity restored.'
+      : null,
+    huuid: result.huuid,
+    bloodType: result.bloodType,
+    criticalAllergies: result.criticalAllergies,
+    expiresAt: result.expiresAt ? result.expiresAt.toISOString() : null,
+    source: 'qr_card',
+  });
+});
+
 // GET /debug/resolver -- local developer page, not part of the EMR API
 // surface. Left unauthenticated on purpose (mirrors the main resolver's own
 // /debug/resolver page, which a human opens directly in a browser and can't
@@ -107,6 +200,21 @@ app.get('/debug/resolver', async (_req: Request, res: Response) => {
     )
     .join('\n');
 
+  // Month 4, Step 8: resolver public key status + last 5 QR verifications.
+  const qrStatus = getQRVerificationStatus();
+  const resolverKeyId = getResolverKeyId();
+  const qrLogRows = getRecentQRVerifications()
+    .map(
+      (v) => `<tr>
+        <td>${escapeHtml(v.timestamp)}</td>
+        <td>${v.valid ? 'valid' : 'INVALID'}</td>
+        <td>${v.expired ? 'yes' : 'no'}</td>
+        <td>${v.huuid ? escapeHtml(v.huuid) : '-'}</td>
+        <td>${v.error ? escapeHtml(v.error) : '-'}</td>
+      </tr>`
+    )
+    .join('\n');
+
   res.status(200).type('html').send(`<!doctype html>
 <html><head><title>HUUID Stub -- Debug: Resolver Cache</title>
 <style>body{font-family:monospace;margin:2rem}table{border-collapse:collapse;width:100%}
@@ -119,21 +227,79 @@ td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;font-size:0.85rem}</
 <tr><th>Local Patient ID</th><th>HUUID</th><th>Blood Type</th><th>Allergies</th><th>Source</th><th>Verified At</th></tr>
 ${rows || '<tr><td colspan="6">No cache entries yet -- call POST /verify first.</td></tr>'}
 </table>
+
+<h1>QR Verification (Tier 4)</h1>
+<p>Status: ${qrStatus.toUpperCase()}${resolverKeyId ? ` | Key ID: ${escapeHtml(resolverKeyId)}` : ''}</p>
+<p>Test scans at <a href="/debug/qr">/debug/qr</a>.</p>
+<table>
+<tr><th>Timestamp</th><th>Result</th><th>Expired</th><th>HUUID</th><th>Error</th></tr>
+${qrLogRows || '<tr><td colspan="5">No QR verifications yet.</td></tr>'}
+</table>
 </body></html>`);
 });
 
-// GET /debug/qr -- honest stub. QR verification is explicitly deferred for
-// this build step ("Do not build QR verification yet").
+// GET/POST /debug/qr -- local developer test page for tier 4, Step 8.
+// Unauthenticated on purpose, same reasoning as /debug/resolver: a human
+// opens this directly in a browser and can't attach X-Local-Auth to a form
+// submit. Calls verifyQRToken() directly (read-only -- never
+// recordQRVerification(), since there is no real localPatientId context on
+// this page, only a pasted test payload) so it can be used without the
+// header POST /qr/verify requires. Shares the same in-memory verification
+// log as the real endpoint, so a manual test here shows up in
+// /debug/resolver's "last 5" table too.
 app.get('/debug/qr', (_req: Request, res: Response) => {
-  res.status(200).type('html').send(`<!doctype html>
-<html><head><title>HUUID Stub -- Debug: QR Scan</title></head>
-<body style="font-family:monospace;margin:2rem">
-<h1>QR Scan -- Not Implemented Yet</h1>
-<p>QR card verification (resolution tier 4, offline token signature check) is
-scheduled for a later Month 4 build step, after integrity hashing. This page
-exists so the route is present, but it does not perform a scan.</p>
-</body></html>`);
+  res.status(200).type('html').send(renderDebugQrPage());
 });
+
+app.post('/debug/qr', express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const payload = typeof req.body?.payload === 'string' ? req.body.payload.trim() : '';
+  if (!payload) {
+    res.status(200).type('html').send(renderDebugQrPage({ error: 'Paste a QR token payload first.' }));
+    return;
+  }
+
+  const keyBytes = getResolverPublicKeyBytes();
+  if (!keyBytes) {
+    res.status(200).type('html').send(
+      renderDebugQrPage({ error: 'No resolver public key cached. Run npm run download-keys.', payload })
+    );
+    return;
+  }
+
+  const result = verifyQRToken(payload, keyBytes);
+  recordQRVerificationAttempt(result);
+  res.status(200).type('html').send(renderDebugQrPage({ result, payload }));
+});
+
+function renderDebugQrPage(opts?: {
+  result?: ReturnType<typeof verifyQRToken>;
+  payload?: string;
+  error?: string;
+}): string {
+  const { result, payload = '', error } = opts ?? {};
+  const resultHtml = result
+    ? `<h2>${result.valid ? 'VALID' : 'INVALID'}${result.expired ? ' (EXPIRED)' : ''}</h2>
+       <pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>`
+    : '';
+  const errorHtml = error ? `<p style="color:#b00">${escapeHtml(error)}</p>` : '';
+
+  return `<!doctype html>
+<html><head><title>HUUID Stub -- Debug: QR Scan</title>
+<style>body{font-family:monospace;margin:2rem}textarea{width:100%;height:6rem}pre{background:#f4f4f4;padding:1rem;overflow-x:auto}</style>
+</head><body>
+<h1>QR Scan Test (Tier 4, offline)</h1>
+<p>Paste a base64url-encoded QR token payload to verify it locally, with no
+network call to the resolver. This is a developer test page, not the real
+EMR-facing endpoint -- the real endpoint is <code>POST /qr/verify</code>
+(requires <code>X-Local-Auth</code>).</p>
+<form method="POST" action="/debug/qr">
+<textarea name="payload" placeholder="base64url payload">${escapeHtml(payload)}</textarea><br>
+<button type="submit">Verify</button>
+</form>
+${errorHtml}
+${resultHtml}
+</body></html>`;
+}
 
 function escapeHtml(value: string): string {
   return value

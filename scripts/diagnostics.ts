@@ -4,6 +4,7 @@ import { cacheStats, isDbFileEncrypted } from '../src/cache.js';
 import { getMigrationOutcome } from '../src/keystore-migration.js';
 import { runIntegrityCheck } from '../src/integrity-check.js';
 import { loadConfig } from '../src/config.js';
+import { loadResolverPublicKeyAtStartup, getQRVerificationStatus, getResolverKeyId } from '../src/resolver-key.js';
 
 // diagnostics.ts runs as its own one-shot process, separate from any
 // running `npm run start` -- integrity-check.ts's last-check state is only
@@ -70,6 +71,20 @@ const overrideConfigured = loadConfig().HUUID_INTEGRITY_OVERRIDE;
 console.log(`Integrity override: ${overrideConfigured ? 'ACTIVE (WARNING)' : 'inactive'}`);
 console.log('');
 
+// Month 4, QR verification. Fresh per-process load, same reasoning as
+// runIntegrityCheck() above -- resolver-key.ts's in-memory state only
+// exists within whichever process called loadResolverPublicKeyAtStartup(),
+// so a standalone diagnostics run must call it itself to report accurately.
+loadResolverPublicKeyAtStartup();
+const qrStatus = getQRVerificationStatus();
+const resolverKeyCached = qrStatus === 'ready';
+console.log(`Resolver public key: ${resolverKeyCached ? 'CACHED' : 'MISSING'}`);
+if (!resolverKeyCached) {
+  console.warn('WARNING: Run npm run download-keys. QR verification (tier 4) is unavailable until then.');
+}
+console.log(`QR verification: ${qrStatus === 'ready' ? 'READY' : 'NOT READY'}`);
+console.log('');
+
 const report = {
   timestamp: new Date().toISOString(),
   ...status,
@@ -83,7 +98,11 @@ const report = {
     reachable: resolverReachability.ok,
     detail: resolverReachability.detail,
   },
-  hardeningNotStarted: ['QR card offline verification (resolution tier 4)'],
+  qr: {
+    status: qrStatus,
+    resolverPublicKeyCached: resolverKeyCached,
+    resolverKeyId: getResolverKeyId(),
+  },
 };
 
 console.log(JSON.stringify(report, null, 2));

@@ -32,9 +32,16 @@ const envSchema = z.object({
   // full spec this arrives via `download-keys` -- that endpoint does not exist yet
   // on the live resolver (see repo README), so for now this path is filled manually.
   HUUID_FACILITY_PRIVATE_KEY_PATH: z.string().default('./keys/facility-private-key.pem'),
-  // Reserved for offline QR/token verification -- not used until QR verification
-  // is built (explicitly deferred for this build step).
-  HUUID_RESOLVER_PUBLIC_KEY_PATH: z.string().default('./keys/resolver-public-key.pem'),
+  // QR verification (tier 4 offline fallback), Month 4. Path is .json, not
+  // .pem -- a deliberate deviation from HUUID-EMR-STUB-v0.1.2.docx Section 4
+  // step 5, which names resolver-public-key.pem. The resolver's
+  // GET /1.0/resolver-public-key returns JSON (publicKeyMultibase, keyId,
+  // validFrom, algorithm) -- keyId/validFrom have no natural home in a bare
+  // PEM file, and the Stub needs them for /health and /debug/resolver
+  // reporting, not just the raw key bytes. Documented in
+  // docs/TECHNICAL-DECISIONS.md, same treatment as the AES-CBC-vs-GCM
+  // spec/implementation variance.
+  HUUID_RESOLVER_PUBLIC_KEY_PATH: z.string().default('./keys/resolver-public-key.json'),
 
   HUUID_CACHE_DB_PATH: z.string().default('./data/huuid-cache.db'),
 

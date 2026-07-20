@@ -9,6 +9,7 @@ import {
   cacheAgeSeconds,
   FRESH_WINDOW_SECONDS,
   CACHE_VALID_SECONDS,
+  TTL_SECONDS,
   type CacheEntry,
 } from './cache.js';
 
@@ -16,7 +17,13 @@ export type { PurposeCode };
 
 export interface HUUIDResult {
   success: boolean;
-  source: 'resolver' | 'cache' | 'qr_card' | 'not_found';
+  // 'qr_card_required' added Month 4 (Step 5) -- additive, does not change
+  // the meaning of any existing value. 'not_found' is still reachable in
+  // principle (see gap note above) but tiers 1-3 exhausting now yields
+  // 'qr_card_required' instead, per HUUID-EMR-STUB-v0.1.2.docx Section 3.1's
+  // resolution priority table putting QR card scan (tier 4) before "not
+  // found" (tier 5).
+  source: 'resolver' | 'cache' | 'qr_card' | 'qr_card_required' | 'not_found';
   huuid: string | null;
   displayName: string | null;
   bloodType: string | null;
@@ -94,11 +101,14 @@ export async function verifyPatient(
     return resultFromLive(live, 'resolver');
   }
 
-  // Tier 4 (QR card scan) is explicitly deferred for this build step --
-  // falls through to tier 5, not_found.
+  // Tiers 1-3 exhausted (no cache at all, live resolver unreachable). Tier 4
+  // is QR card scan -- verifyPatient() cannot perform that itself (it
+  // requires a physical scan via POST /qr/verify, a separate request), so it
+  // signals the caller to prompt for one rather than declaring not_found
+  // outright.
   return {
     success: false,
-    source: 'not_found',
+    source: 'qr_card_required',
     huuid: null,
     displayName: null,
     bloodType: null,
@@ -106,7 +116,52 @@ export async function verifyPatient(
     serviceEndpoints: [],
     resolvedAt: new Date().toISOString(),
     cacheAge: 0,
-    error: live.reason,
+    error: 'Resolver unreachable and no cache entry. Please scan patient QR card.',
+  };
+}
+
+/**
+ * Called by POST /qr/verify (server.ts) after a QR token passes signature
+ * verification -- never on an invalid signature (that returns 400 with no
+ * health data, per Step 4, before this function is ever reached). TTL is
+ * min(token expiry, 72 hours) per Section 3.1's tier 4 cache behavior ("Stores
+ * verified QR data in cache for 72 hours") -- an already-expired-but-validly-
+ * signed token naturally floors to ~0 forward validity via Math.max below,
+ * which is correct: it's still cached (so /debug/resolver and a same-second
+ * re-verify see it) but immediately eligible for tier 3's "prefer a fresh
+ * live resolution" behavior on the very next lookup, not tier 2's 15-minute
+ * skip-the-live-call fast path.
+ */
+export async function recordQRVerification(
+  localPatientId: string,
+  qr: { huuid: string; bloodType: string | null; criticalAllergies: string[]; expiresAtSeconds: number }
+): Promise<HUUIDResult> {
+  const now = Math.floor(Date.now() / 1000);
+  const ttl = Math.max(Math.min(qr.expiresAtSeconds - now, TTL_SECONDS.qr_card), 0);
+
+  await upsertCacheEntry({
+    localPatientId,
+    huuid: qr.huuid,
+    displayName: null,
+    bloodType: qr.bloodType,
+    criticalAllergies: qr.criticalAllergies,
+    serviceEndpoints: [],
+    source: 'qr_card',
+    tokenExpiresAt: now + ttl,
+    verifiedAt: now,
+  });
+
+  return {
+    success: true,
+    source: 'qr_card',
+    huuid: qr.huuid,
+    displayName: null,
+    bloodType: qr.bloodType,
+    criticalAllergies: qr.criticalAllergies,
+    serviceEndpoints: [],
+    resolvedAt: new Date(now * 1000).toISOString(),
+    cacheAge: 0,
+    error: null,
   };
 }
 

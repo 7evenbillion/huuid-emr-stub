@@ -11,7 +11,8 @@ the Next.js resolver (`huuid-resolver`). It runs locally at each clinic.
 ## Status
 
 **Base build + Security Layer 1 (SQLCipher, P1) + Security Layer 2 (OS
-keystore, P2) + Security Layer 3 (process integrity hashing, P4).** The
+keystore, P2) + Security Layer 3 (process integrity hashing, P4) +
+Security Layer 4 (QR card offline verification, resolution tier 4).** The
 local cache DB is AES-256-CBC + HMAC-SHA512 encrypted (SQLCipher's real
 cipher -- not GCM, see below), keyed by HKDF-SHA256 over the facility
 private key. The facility private key itself lives in the OS credential
@@ -21,12 +22,14 @@ file is shredded and deleted at that point. A file fallback remains for
 the transition period before that script has been run. `npm run
 install-integrity-baseline` signs a manifest of every `src/`/`scripts/`
 file (plus `package-lock.json`) with the facility key; `npm run start`
-verifies it on every startup and every 6 hours thereafter. **Explicitly
-not implemented yet** (by design, one layer at a time):
+verifies it on every startup and every 6 hours thereafter. `POST
+/qr/verify` verifies an offline QR card token entirely without network
+access, against a resolver public key cached locally by `npm run
+download-keys` -- see "QR card verification (tier 4, P4)" below for how
+it works and a real, load-bearing honesty note about the test key used to
+build and verify it.
 
-- QR card offline verification (resolution tier 4)
-
-`npm run diagnostics` reports this honestly as not-yet-started.
+`npm run diagnostics` reports all of the above.
 
 ### `keytar` replaced with `@napi-rs/keyring`
 
@@ -259,6 +262,76 @@ surfaced but its stated scope didn't cover: an override alert (Gap 1)
 needs somewhere to record `override: true`, which didn't exist until
 this was added.
 
+### QR card verification (tier 4, P4)
+
+Resolution priority order (Section 3.1): live resolver -> local cache
+(fresh) -> stale cache (warn) -> QR card scan -> not found. This build
+step implements tier 4: `GET /1.0/resolver-public-key` on the resolver
+(unauthenticated, publishes the resolver's signing public key), `npm run
+download-keys` (fetches it, caches `keys/resolver-public-key.json` read-
+only), `src/qr-verifier.ts` (`verifyQRToken`, fully offline -- no network,
+no filesystem, no cache access, receives only the resolver's public key
+bytes), and `POST /qr/verify` (the authenticated route that calls it and
+persists a verified result to the local cache).
+
+**Deliberate deviation from the spec doc: `.json`, not `.pem`.**
+HUUID-EMR-STUB-v0.1.2.docx Section 4 step 5 names `resolver-public-
+key.pem`. The resolver's endpoint returns JSON (`publicKeyMultibase`,
+`keyId`, `validFrom`, `algorithm`) -- `keyId` and `validFrom` have no
+natural home in a bare PEM file, and both are needed for `/health` and
+`/debug/resolver` reporting, not just the raw key bytes. Same treatment
+as the AES-CBC-vs-GCM spec/implementation variance elsewhere in this doc.
+
+**Expired-but-signed tokens are not rejected.** Per spec: an expired QR
+token with a valid signature still returns `valid: true, expired: true`
+with blood type and allergies intact, plus a warning telling the
+clinician to re-verify once connectivity returns. The alternative --
+refusing to show anything for an expired card -- is worse for emergency
+care than showing possibly-stale-but-signed data with a visible warning.
+Only an invalid *signature* blocks data (`valid: false`, `400`, no health
+fields in the response at all -- enforced inside `qr-verifier.ts` itself,
+not just at the route, so a tampered card's data can never leave the
+verification function in the first place).
+
+**Real, load-bearing honesty note: test tokens and the "resolver's" own
+published key are currently the same key.** Both `GET
+/1.0/resolver-public-key` and this build step's test tokens are signed
+with `HUUID_TEST_FACILITY_JWK` -- the only signing keypair that exists in
+this shared build/test environment, also used throughout this repo as the
+seeded test facility's key. That means every DoD test in this step
+(`valid: true` for a good token, `Invalid signature` for a tampered one)
+proves the **verification logic** is correct, but does **not** prove
+signer/verifier key separation, because there is no separation to prove
+here -- issuer and verifier keys are identical by construction. **What
+this means for production:** the resolver needs its own distinct signing
+keypair, generated and held only by the Root Authority, used exclusively
+to sign patient QR cards at enrollment -- never a facility's own key, and
+never reused for JWT/ProviderJWT/Break-Glass signing the way the shared
+test key currently stands in for multiple roles. Nothing in this codebase
+issues a real QR card yet, either -- only verification is built. Both are
+tracked as pre-pilot items, not silently assumed solved by these tests
+passing.
+
+**Non-fatal by design.** A missing or unreadable `keys/resolver-public-
+key.json` logs a warning at startup and leaves `qr_verification:
+"no_key"` (or `"error"` if the file exists but is malformed) on `/health`
+and `npm run diagnostics` -- it does not stop the Stub from starting or
+serving tiers 1-3. QR is a fallback tier, not a core requirement.
+
+**`/debug/qr` now actually verifies.** It used to be an honest "not
+implemented yet" stub. Now that verification is built, leaving that page
+saying so would repeat the exact overclaiming mistake this build already
+corrected once this session (see the integrity-override honesty fix
+above) -- so it's now a real interactive test page (paste a base64url
+payload, see the verification result), unauthenticated on purpose like
+`/debug/resolver` (a human opens it directly in a browser and can't
+attach `X-Local-Auth` to a form submit). It calls `verifyQRToken()`
+directly and never writes to the patient cache -- there is no
+`localPatientId` context on this page, only a pasted test payload, so it
+stays read-only by design. It does share the same in-memory "last 5
+verifications" log as the real `POST /qr/verify` endpoint, both surfaced
+on `/debug/resolver`.
+
 ## Setup
 
 ```
@@ -285,9 +358,21 @@ npm run start
   QR-card scan at first encounter, which is explicitly deferred this step.
   For now, a cache-miss `localPatientId` is passed directly to the resolver
   as a candidate DID. Real MRNs will not resolve until QR linking exists.
-- **`download-keys` is not implemented.** No endpoint exists on the live
-  resolver to serve facility keys. Placeholder script explains this and
-  exits non-zero rather than faking success.
+- **`download-keys` fetches the resolver public key, but not the facility
+  private key.** `GET /1.0/resolver-public-key` exists now (Month 4, QR
+  verification) and this script uses it successfully. The other half of
+  the original gap remains open: no endpoint exists anywhere on the live
+  resolver to serve a *facility's* signing key, so
+  `HUUID_FACILITY_PRIVATE_KEY_PATH` still requires a manually-placed PEM.
+- **No real QR card issuance exists.** This build step implements
+  verification only. There is no code anywhere that generates or signs a
+  patient QR card -- see "QR card verification (tier 4, P4)" above for
+  what that also means about test-token key reuse.
+- **No Root Authority alerting on integrity violations or overrides.**
+  Rows are written to the resolver's `huuid_stub_integrity_log`
+  (verified, immutable) but nobody is emailed, texted, or paged. Needs a
+  real domain for the resolver project and a confirmed `RESEND_API_KEY`
+  -- an operator decision, tracked in `huuid-resolver/api.md`.
 - **The live resolver does not yet return `bloodType` / `criticalAllergies`.**
   The example DID Document in the Resolution Spec (Section 2.1) includes an
   `offlineToken` with these fields, but the actual Month 2/3 resolver's
@@ -312,7 +397,7 @@ npm run start
 | `check-permissions` | Implemented |
 | `install-service` (Windows) | Implemented -- generates a wrapper + prints `sc.exe` commands; does not self-elevate |
 | `install-systemd` (Linux) | Implemented -- generates a unit file + prints `systemctl` commands; does not self-install |
-| `download-keys` | Not implemented -- no live endpoint yet |
+| `download-keys` | Implemented -- fetches `GET /1.0/resolver-public-key`, caches `keys/resolver-public-key.json` read-only. Facility private key download is still not implemented (no endpoint exists for that). |
 | `secure-keys` | Implemented -- imports the facility key to the OS keystore, verifies the roundtrip, then shreds + deletes the PEM. Halts without deleting anything if verification fails. |
 | `install-integrity-baseline` | Implemented -- signs a manifest of `src/`/`scripts/`/`package-lock.json` with the facility key, writes it read-only. Warns and asks for confirmation before overwriting an existing baseline. |
 
@@ -337,5 +422,6 @@ second, disconnected path under `src/`.
 |---|---|---|
 | `GET /health` | none | Local system status (no external calls) |
 | `POST /verify` | `X-Local-Auth` | The EMR integration surface -- calls `verifyPatient()` |
-| `GET /debug/resolver` | none | Local cache contents (developer page, mirrors the resolver repo's own `/debug/resolver`) |
-| `GET /debug/qr` | none | Explains QR scanning isn't built yet |
+| `POST /qr/verify` | `X-Local-Auth` | Resolution tier 4 -- offline QR card token verification, calls `verifyQRToken()` |
+| `GET /debug/resolver` | none | Local cache contents + resolver public key status + last 5 QR verifications (developer page, mirrors the resolver repo's own `/debug/resolver`) |
+| `GET /debug/qr` | none | Interactive QR token verification test page (paste a payload, see the result) |

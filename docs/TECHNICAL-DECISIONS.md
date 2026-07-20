@@ -292,3 +292,61 @@ the override flag on the floor.
 **Do not remove the facility lookup or signature
 check to "simplify" this endpoint. That is Gap 2,
 reopened.**
+
+---
+
+## 12. QR verification (tier 4): .json over .pem, and the shared-key honesty note
+
+**Decision:** `HUUID_RESOLVER_PUBLIC_KEY_PATH` defaults to
+`./keys/resolver-public-key.json`, not the `.pem` HUUID-
+EMR-STUB-v0.1.2.docx Section 4 step 5 names.
+
+**Why:** The resolver's `GET /1.0/resolver-public-key`
+returns `{ publicKeyMultibase, keyId, validFrom,
+algorithm }`. `keyId` and `validFrom` are consumed
+directly by `/health` and `/debug/resolver` -- a bare
+PEM has no field for either. Same treatment as the
+AES-CBC-vs-GCM spec/implementation variance (§2):
+documented rather than silently done.
+
+**Real bug caught by testing this, not by inspection:**
+`.env` and `config-template.env` both still had the
+OLD `.pem` path hardcoded from when this variable was
+first added (before QR verification existed), silently
+overriding the new default in `config.ts`. The first
+`npm run download-keys` run wrote to
+`keys/resolver-public-key.pem` instead of `.json` --
+caught by checking the actual file on disk rather than
+trusting the script's own "success" printout. Both env
+files were wrong in the same way; fixing only `config.ts`
+would not have fixed the bug.
+
+**The single most important honesty note in this
+build step:** `GET /1.0/resolver-public-key` and every
+test token signed for this step's DoD both use
+`HUUID_TEST_FACILITY_JWK` -- the only signing keypair
+that exists anywhere in this shared build environment.
+Verifying a test-signed token against the "resolver's"
+published key therefore proves the verification LOGIC
+is correct (base64url/JSON parsing, version check, exp
+handling, EdDSA verification, tamper rejection) but
+proves NOTHING about signer/verifier key separation,
+because there is no separation in this test setup --
+issuer and verifier are, by construction, the same key.
+
+**What production actually needs, not yet built:** a
+distinct resolver-owned signing keypair, held only by
+the Root Authority, used exclusively to sign patient QR
+cards at enrollment -- never a facility's own key, and
+never shared with JWT/ProviderJWT/Break-Glass signing
+the way one test key currently stands in for all of
+them across this whole session's build steps. Nothing
+in either repo issues a real QR card yet either --
+verification only. Both are pre-pilot items.
+
+**Do not read a passing DoD 3-5 (valid/tampered/expired
+token tests) as proof that key separation works. It
+proves the opposite question was answered correctly --
+"does this code verify a signature correctly" -- not
+"can a facility forge a card," which is unfalsifiable
+until the resolver has its own key.**

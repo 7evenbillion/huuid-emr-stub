@@ -1,17 +1,67 @@
-/**
- * NOT IMPLEMENTED -- flagged, not faked.
- *
- * HUUID-EMR-STUB-v0.1.2.docx Section 4, install step 5 expects this to
- * download ./keys/resolver-public-key.pem and ./keys/facility-private-key.pem
- * from the HUUID Protocol Working Group. The live resolver (huuid-resolver,
- * Month 2/3) has no key-distribution endpoint anywhere in its route table
- * (see HANDOFF.md) -- there is nothing for this script to call yet.
- *
- * Until that endpoint exists, place a PKCS8-PEM Ed25519 private key for your
- * facility at HUUID_FACILITY_PRIVATE_KEY_PATH manually.
- */
-console.log('download-keys: NOT IMPLEMENTED.');
-console.log('The live resolver has no key-distribution endpoint yet (see README.md).');
-console.log('Place your facility private key manually at the path set by');
-console.log('HUUID_FACILITY_PRIVATE_KEY_PATH in your .env (PKCS8 PEM, Ed25519).');
-process.exit(1);
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { z } from 'zod';
+import { loadConfig } from '../src/config.js';
+import { setReadOnly } from '../src/file-permissions.js';
+
+// Month 4, QR verification Step 2. HUUID-EMR-STUB-v0.1.2.docx Section 4 step 5
+// names ./keys/resolver-public-key.pem; this Stub saves .json instead -- see
+// config.ts's HUUID_RESOLVER_PUBLIC_KEY_PATH comment and
+// docs/TECHNICAL-DECISIONS.md for why (keyId/validFrom need a home, PEM has
+// none). Facility-private-key.pem download still has no endpoint (see
+// README) -- this script only fetches the resolver's public key.
+
+const resolverPublicKeySchema = z.object({
+  publicKeyMultibase: z.string().min(1),
+  keyId: z.string().min(1),
+  validFrom: z.string().min(1),
+  algorithm: z.literal('Ed25519'),
+});
+
+async function main(): Promise<void> {
+  const config = loadConfig();
+  const url = `${config.HUUID_RESOLVER_BASE_URL}/1.0/resolver-public-key`;
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), config.HUUID_RESOLVER_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(url, { method: 'GET', signal: controller.signal });
+  } catch (err) {
+    const aborted = err instanceof Error && err.name === 'AbortError';
+    console.error(
+      aborted
+        ? `download-keys: request to ${url} timed out after ${config.HUUID_RESOLVER_TIMEOUT_MS}ms.`
+        : `download-keys: network error contacting ${url}: ${err instanceof Error ? err.message : 'unknown error'}`
+    );
+    process.exit(1);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+
+  if (!res.ok) {
+    console.error(`download-keys: resolver returned HTTP ${res.status} from ${url}.`);
+    process.exit(1);
+  }
+
+  const parsed = resolverPublicKeySchema.safeParse(await res.json());
+  if (!parsed.success) {
+    console.error('download-keys: resolver response did not match the expected shape:');
+    console.error(parsed.error.message);
+    process.exit(1);
+  }
+
+  const destPath = config.HUUID_RESOLVER_PUBLIC_KEY_PATH;
+  const destDir = dirname(destPath);
+  if (!existsSync(destDir)) {
+    mkdirSync(destDir, { recursive: true });
+  }
+
+  writeFileSync(destPath, JSON.stringify(parsed.data, null, 2) + '\n', { mode: 0o644 });
+  setReadOnly(destPath);
+
+  console.log('Resolver public key downloaded and cached.');
+  console.log(` Key ID: ${parsed.data.keyId}`);
+}
+
+void main();
