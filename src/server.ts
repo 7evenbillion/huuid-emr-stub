@@ -1,11 +1,14 @@
 import express, { type Request, type Response } from 'express';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
-import { localAuthMiddleware } from './local-auth.js';
+import { initFacilityKeyModule, deriveCacheEncryptionKeyHex } from './facility-key.js';
+import { initLocalAuthModule, localAuthMiddleware } from './local-auth.js';
+import { initResolverClientModule } from './resolver-client.js';
+import { initIntegrityCheckModule, runIntegrityCheck, enforceStartupIntegrity } from './integrity-check.js';
+import { initResolverKeyModule } from './resolver-key.js';
+import { initStatusModule, getSystemStatus } from './status.js';
 import { verifyPatient, recordQRVerification, type PurposeCode } from './verify-patient.js';
-import { getSystemStatus } from './status.js';
-import { listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
-import { runIntegrityCheck, enforceStartupIntegrity } from './integrity-check.js';
+import { initCacheModule, listCacheEntries, cacheStats, isDbFileEncrypted, initializeCache } from './cache.js';
 import { verifyQRToken } from './qr-verifier.js';
 import {
   loadResolverPublicKeyAtStartup,
@@ -17,10 +20,52 @@ import { recordQRVerificationAttempt, getRecentQRVerifications } from './qr-veri
 
 const config = loadConfig();
 
+// P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): server.ts is the ORCHESTRATOR --
+// the only place in the running server process that ever reads
+// process.env/loadConfig() for HUUID_ secrets. Every module below gets only
+// the narrow slice it needs, via its own initXModule() call, never the full
+// config object and never a live loadConfig() call of its own.
+initFacilityKeyModule({
+  facilityDID: config.HUUID_FACILITY_DID,
+  facilityPrivateKeyPath: config.HUUID_FACILITY_PRIVATE_KEY_PATH,
+});
+initLocalAuthModule({ localSecretPath: config.HUUID_LOCAL_AUTH_SECRET_PATH });
+initResolverClientModule({
+  resolverBaseUrl: config.HUUID_RESOLVER_BASE_URL,
+  facilityDID: config.HUUID_FACILITY_DID,
+  facilityCode: config.HUUID_FACILITY_CODE,
+  timeoutMs: config.HUUID_RESOLVER_TIMEOUT_MS,
+});
+initIntegrityCheckModule({
+  facilityDID: config.HUUID_FACILITY_DID,
+  resolverBaseUrl: config.HUUID_RESOLVER_BASE_URL,
+  timeoutMs: config.HUUID_RESOLVER_TIMEOUT_MS,
+  integrityOverride: config.HUUID_INTEGRITY_OVERRIDE,
+});
+initResolverKeyModule({ resolverPublicKeyPath: config.HUUID_RESOLVER_PUBLIC_KEY_PATH });
+initStatusModule({
+  facilityDID: config.HUUID_FACILITY_DID,
+  facilityCode: config.HUUID_FACILITY_CODE,
+  resolverBaseUrl: config.HUUID_RESOLVER_BASE_URL,
+});
+
+// Cache encryption key is derived once, here, by facility-key.ts (the only
+// module that ever touches raw private-key bytes) -- cache.ts receives only
+// the resulting hex string, never facilityDID or any key-derivation
+// capability. Same "one clear message and a clean exit" behavior as before
+// (Step 4/6 of the SQLCipher build step, DoD item 6 that step) -- the point
+// where a missing facility private key surfaces just moved one call earlier.
+let cacheEncryptionKeyHex: string;
+try {
+  cacheEncryptionKeyHex = await deriveCacheEncryptionKeyHex();
+} catch (err) {
+  console.error(`Cache initialization failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+  process.exit(1);
+}
+initCacheModule({ dbPath: config.HUUID_CACHE_DB_PATH, cacheEncryptionKeyHex });
+
 // Open (and encrypt, if not already) the cache DB before accepting any
-// requests, so a missing facility private key (in both the keystore and the
-// file fallback) is one clear message and a clean exit -- not a crash on the
-// first POST /verify (Step 4/6 of the SQLCipher step, DoD item 6 this step).
+// requests (Step 4/6 of the SQLCipher step, DoD item 6 this step).
 try {
   await initializeCache();
 } catch (err) {
@@ -48,6 +93,19 @@ setInterval(() => {
 // leaves qr_verification as 'no_key'/'error' (surfaced on /health and
 // diagnostics) but does not stop the Stub from serving tiers 1-3.
 loadResolverPublicKeyAtStartup();
+
+// P5, final step: every initXModule() call above has already captured the
+// value it needs into its own module-scoped closure. Nothing downstream of
+// this point reads process.env for an HUUID_ variable again -- config.ts's
+// loadConfig() is memoized (see config.ts's `cached` variable) and is never
+// called a second time in this process, so clearing these now cannot break
+// anything that runs later.
+Object.keys(process.env)
+  .filter((k) => k.startsWith('HUUID_'))
+  .forEach((k) => {
+    process.env[k] = '';
+    delete process.env[k];
+  });
 
 const app = express();
 app.use(express.json());

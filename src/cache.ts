@@ -2,10 +2,35 @@ import { Database } from '@signalapp/sqlcipher';
 import { mkdirSync, existsSync, chmodSync, openSync, readSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
-import { loadConfig } from './config.js';
-import { deriveCacheKeyHex } from './cache-key.js';
 
 export type CacheSource = 'resolver' | 'qr_card';
+
+/**
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): this module receives ONLY
+ * dbPath and a pre-derived cacheEncryptionKeyHex -- never apiKey,
+ * facilityDID, localSecret, or resolverURL. The key itself is derived once
+ * by facility-key.ts (the only module that ever touches raw private-key
+ * bytes) and handed down by the orchestrator; this module never calls
+ * facility-key.ts or config.ts itself.
+ */
+export interface CacheModuleConfig {
+  dbPath: string;
+  cacheEncryptionKeyHex: string;
+}
+
+let moduleConfig: CacheModuleConfig | null = null;
+
+/** Called once by the orchestrator before any other export in this module is used. */
+export function initCacheModule(cfg: CacheModuleConfig): void {
+  moduleConfig = cfg;
+}
+
+function requireInit(): CacheModuleConfig {
+  if (!moduleConfig) {
+    throw new Error('cache module not initialized. Call initCacheModule() first.');
+  }
+  return moduleConfig;
+}
 
 export interface CacheEntry {
   localPatientId: string;
@@ -65,15 +90,15 @@ function restrictDbFilePermissions(path: string): void {
 
 async function getDb(): Promise<Database> {
   if (db) return db;
-  const config = loadConfig();
-  mkdirSync(dirname(config.HUUID_CACHE_DB_PATH), { recursive: true });
+  const cfg = requireInit();
+  mkdirSync(dirname(cfg.dbPath), { recursive: true });
 
-  const keyHex = await deriveCacheKeyHex(); // throws with a clear message if no facility private key is found anywhere
-
-  db = new Database(config.HUUID_CACHE_DB_PATH);
-  // Raw pre-derived key (Step 2's HKDF output) via SQLCipher's x'...' hex-key
-  // syntax -- this bypasses SQLCipher's own passphrase KDF entirely.
-  db.pragma(`key = "x'${keyHex}'"`);
+  db = new Database(cfg.dbPath);
+  // Raw pre-derived key (Step 2's HKDF output, derived by facility-key.ts
+  // and handed to this module's init -- see initCacheModule()) via
+  // SQLCipher's x'...' hex-key syntax -- this bypasses SQLCipher's own
+  // passphrase KDF entirely.
+  db.pragma(`key = "x'${cfg.cacheEncryptionKeyHex}'"`);
   db.pragma('cipher_page_size = 4096');
   // kdf_iter is a no-op in raw-key mode (verified empirically: SQLCipher only
   // runs its internal PBKDF2 when deriving a key from a passphrase). Set for
@@ -100,7 +125,7 @@ async function getDb(): Promise<Database> {
     );
   `);
 
-  restrictDbFilePermissions(config.HUUID_CACHE_DB_PATH);
+  restrictDbFilePermissions(cfg.dbPath);
   return db;
 }
 
@@ -227,10 +252,10 @@ export async function listCacheEntries(limit = 100): Promise<CacheEntry[]> {
 }
 
 export async function cacheStats(): Promise<{ totalEntries: number; dbPath: string }> {
-  const config = loadConfig();
+  const cfg = requireInit();
   const database = await getDb();
   const n = (database.prepare('SELECT COUNT(*) as n FROM huuid_local_cache').get([]) as { n: number }).n;
-  return { totalEntries: n, dbPath: config.HUUID_CACHE_DB_PATH };
+  return { totalEntries: n, dbPath: cfg.dbPath };
 }
 
 /**

@@ -1,6 +1,32 @@
 import { readFileSync, existsSync } from 'node:fs';
 import bs58 from 'bs58';
-import { loadConfig } from './config.js';
+
+/**
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): extending the same
+ * least-privilege pattern to this module even though it wasn't one of the
+ * six explicitly named -- it only ever reads a PUBLIC key (the resolver's
+ * own, published at GET /1.0/resolver-public-key), never a secret, but
+ * keeping every module off loadConfig()/process.env uniformly is what
+ * actually makes "grep confirms zero hits" a meaningful, whole-codebase
+ * check rather than one with quiet carve-outs.
+ */
+export interface ResolverKeyModuleConfig {
+  resolverPublicKeyPath: string;
+}
+
+let moduleConfig: ResolverKeyModuleConfig | null = null;
+
+/** Called once by the orchestrator before loadResolverPublicKeyAtStartup() is used. */
+export function initResolverKeyModule(cfg: ResolverKeyModuleConfig): void {
+  moduleConfig = cfg;
+}
+
+function requireInit(): ResolverKeyModuleConfig {
+  if (!moduleConfig) {
+    throw new Error('resolver-key module not initialized. Call initResolverKeyModule() first.');
+  }
+  return moduleConfig;
+}
 
 const ED25519_MULTICODEC_PREFIX = Buffer.from([0xed, 0x01]);
 
@@ -60,8 +86,7 @@ export function getQRVerificationStatus(): QRVerificationStatus {
  * normally with no resolver public key present at all.
  */
 export function loadResolverPublicKeyAtStartup(): void {
-  const config = loadConfig();
-  const path = config.HUUID_RESOLVER_PUBLIC_KEY_PATH;
+  const path = requireInit().resolverPublicKeyPath;
 
   if (!existsSync(path)) {
     console.warn(

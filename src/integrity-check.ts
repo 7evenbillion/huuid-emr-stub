@@ -1,10 +1,40 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { computeManifest, verifyManifestSignature, signManifestHash } from './integrity-manifest.js';
-import { loadConfig } from './config.js';
+import { computeManifest } from './integrity-manifest.js';
+import { verifyManifestSignature, signManifestHash } from './facility-key.js';
 
 const BASELINE_PATH = join(process.cwd(), 'integrity', 'baseline.hmac');
 const STUB_VERSION = '0.1.2';
+
+/**
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): this module receives
+ * facilityDID plus a reference to the signing module's exported functions
+ * (signManifestHash/verifyManifestSignature, imported above from
+ * facility-key.js) -- never the raw private key. resolverBaseUrl and
+ * timeoutMs are non-secret operational values this module already needed
+ * to reach POST /1.0/stub-integrity; integrityOverride is the
+ * HUUID_INTEGRITY_OVERRIDE flag read once by the orchestrator.
+ */
+export interface IntegrityCheckModuleConfig {
+  facilityDID: string;
+  resolverBaseUrl: string;
+  timeoutMs: number;
+  integrityOverride: boolean;
+}
+
+let moduleConfig: IntegrityCheckModuleConfig | null = null;
+
+/** Called once by the orchestrator before any other export in this module is used. */
+export function initIntegrityCheckModule(cfg: IntegrityCheckModuleConfig): void {
+  moduleConfig = cfg;
+}
+
+function requireInit(): IntegrityCheckModuleConfig {
+  if (!moduleConfig) {
+    throw new Error('integrity-check module not initialized. Call initIntegrityCheckModule() first.');
+  }
+  return moduleConfig;
+}
 
 const GRACE_PERIOD_SECONDS = 60;
 const COUNTDOWN_INTERVAL_SECONDS = 10;
@@ -53,9 +83,9 @@ function sleep(ms: number): Promise<void> {
  * own key produced a signature over exactly the hash value in this alert.
  */
 async function sendViolationAlert(currentManifestHash: string, override: boolean): Promise<void> {
-  const config = loadConfig();
+  const cfg = requireInit();
   const timestamp = new Date().toISOString();
-  const url = `${config.HUUID_RESOLVER_BASE_URL}/1.0/stub-integrity`;
+  const url = `${cfg.resolverBaseUrl}/1.0/stub-integrity`;
 
   let signature: string;
   try {
@@ -74,7 +104,7 @@ async function sendViolationAlert(currentManifestHash: string, override: boolean
   }
 
   const body = {
-    facilityDID: config.HUUID_FACILITY_DID,
+    facilityDID: cfg.facilityDID,
     manifestHash: currentManifestHash,
     stubVersion: STUB_VERSION,
     timestamp,
@@ -84,7 +114,7 @@ async function sendViolationAlert(currentManifestHash: string, override: boolean
   };
 
   const controller = new AbortController();
-  const timeoutHandle = setTimeout(() => controller.abort(), config.HUUID_RESOLVER_TIMEOUT_MS);
+  const timeoutHandle = setTimeout(() => controller.abort(), cfg.timeoutMs);
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -209,9 +239,9 @@ export async function enforceStartupIntegrity(): Promise<void> {
   const status = await runIntegrityCheck();
   if (status !== 'fail') return;
 
-  const config = loadConfig();
+  const cfg = requireInit();
 
-  if (config.HUUID_INTEGRITY_OVERRIDE) {
+  if (cfg.integrityOverride) {
     integrityOverrideActive = true;
     console.warn(
       JSON.stringify({

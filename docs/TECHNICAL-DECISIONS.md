@@ -350,3 +350,109 @@ proves the opposite question was answered correctly --
 "does this code verify a signature correctly" -- not
 "can a facility forge a card," which is unfalsifiable
 until the resolver has its own key.**
+
+## 13. Module isolation (P5): built last, and why raw key access is confined to one module, not just JWT signing
+
+HUUID-EMR-STUB-v0.1.2.docx Section 2 P5 specifies that
+each module receives only the secrets it needs, that no
+module reads `process.env` directly, and that
+`src/server.ts` (the orchestrator) loads every secret
+once at startup and hands each module its own narrow
+slice.
+
+**Why this was built last, not first.** P5 requires
+knowing the full module dependency graph before it can
+be designed correctly -- which modules exist, which of
+them legitimately need which secret, and which pieces of
+logic that look like they belong to one module actually
+touch raw key material on another module's behalf.
+Building P5 before P1-P4 and QR verification existed
+would have meant guessing at that graph and reworking it
+on every subsequent build step as new modules
+(`integrity-check.ts`, `integrity-manifest.ts`,
+`resolver-key.ts`) were added. Building it last, once the
+graph was stable, meant doing this restructuring exactly
+once.
+
+**Raw key confinement goes beyond JWT signing.** The doc's
+wording for `facility-key.ts` ("signs JWTs internally...
+never exposes raw key bytes to other modules") describes
+one use of the private key, but this codebase has three:
+signing a facility JWT (`resolver-client.ts`), signing/
+verifying an integrity manifest hash (`integrity-check.ts`
+via `integrity-manifest.ts`), and deriving two unrelated
+symmetric keys via HKDF (the SQLCipher cache key and the
+manifest's HMAC key -- formerly `cache-key.ts` and a
+private function inside `integrity-manifest.ts`). All
+three needed raw private-key bytes as input. Splitting
+"raw key access" across three modules that each touched
+it a little would have satisfied the letter of "one
+signing module" while leaving raw bytes reachable from
+three places instead of one. Instead, every one of these
+operations was moved into `facility-key.ts` itself, which
+now exports only derived outputs -- a signed JWT string
+(`signFacilityJWT`), a signature (`signManifestHash`), a
+boolean (`verifyManifestSignature`), and derived symmetric
+keys (`deriveCacheEncryptionKeyHex`,
+`deriveManifestHmacKey`). `cache-key.ts` no longer exists;
+its one function moved here. `getFacilityPrivateKeyRaw`
+and `buildEd25519KeyObjectFromRaw` are no longer exported
+at all -- it is now a compile error, not just a convention,
+for another module to import raw key access from this one.
+
+**Precompute-once vs. signing-reference, and why they
+differ.** `cache.ts` receives a single precomputed
+`cacheEncryptionKeyHex` string via `initCacheModule()`,
+called once at startup -- the cache key never changes for
+the life of the process, so there is nothing to gain from
+letting `cache.ts` call back into `facility-key.ts` itself.
+`integrity-check.ts`, by contrast, imports
+`signManifestHash`/`verifyManifestSignature` from
+`facility-key.ts` as ordinary function references and
+calls them fresh on every check (startup, and every 6
+hours) -- a manifest hash is computed over file contents
+that can legitimately change between checks, so there is
+no fixed value to precompute. Both patterns satisfy "never
+receives the raw key"; which one applies depends on
+whether the secret-touching operation's output is constant
+or must be recomputed per call.
+
+**Scope: `server.ts` and `scripts/*.ts` are orchestrators,
+not the six least-privilege modules.** The doc's pattern
+text names `src/server.ts` as *the* orchestrator. This
+codebase has several other independent entry points
+(`diagnostics.ts`, `test-connection.ts`,
+`install-integrity-baseline.ts`, `secure-keys.ts`,
+`download-keys.ts`, `generate-local-secret.ts`,
+`check-permissions.ts`) that each run as their own
+one-shot Node process via `npm run <script>`, not as code
+imported into the running server. Each of these legitimately
+calls `loadConfig()` once, for the same reason `server.ts`
+does -- they are bootstrapping their own process, not
+consuming a secret an orchestrator handed them. `grep`
+confirms zero `loadConfig()`/`process.env.HUUID_` usage in
+every module that IS imported by other modules for runtime
+logic (`cache.ts`, `facility-key.ts`, `resolver-client.ts`,
+`local-auth.ts`, `integrity-check.ts`,
+`integrity-manifest.ts`, `resolver-key.ts`, `status.ts`,
+`qr-verifier.ts` -- the last of these needed no changes at
+all, it already took `resolverPublicKeyBytes` as a plain
+function argument from day one). `resolver-key.ts` and
+`status.ts` were not named explicitly in the doc's P5 list
+(they handle a public key path and display-only facility
+identifiers, neither a secret in the threat-model sense)
+but were brought under the same `initXModule()` pattern
+anyway, so "grep confirms zero hits" is a whole-codebase
+guarantee, not one with quiet carve-outs for the modules
+the doc happened not to name.
+
+**Verified, not asserted.** `npm run diagnostics` computes
+`Module isolation: ACTIVE` by actually clearing every
+`HUUID_`-prefixed `process.env` key after this script's own
+init sequence completes, then checking that none remain --
+the same clearing `server.ts` performs before it starts
+accepting requests. If a future change reintroduces a
+direct `process.env` read in one of the nine library
+modules, or the clearing loop itself regresses, this
+reports `INACTIVE` and lists the leaked keys, rather than
+printing a fixed string regardless of actual state.

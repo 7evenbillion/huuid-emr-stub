@@ -1,40 +1,16 @@
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
-import { createHmac, hkdfSync, createPublicKey, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
-import { loadConfig } from './config.js';
-import { getFacilityPrivateKeyRaw, buildEd25519KeyObjectFromRaw } from './facility-key.js';
-
-const HMAC_SALT_SUFFIX = ':integrity-baseline-v1';
-const HMAC_INFO = 'huuid-integrity-key';
+import { createHmac } from 'node:crypto';
+import { deriveManifestHmacKey } from './facility-key.js';
 
 /**
- * Domain-separated from cache-key.ts's encryption key (different salt
- * suffix, different info string) via the same HKDF-over-facility-private-key
- * pattern -- one root secret, two independent derived keys for two
- * unrelated purposes.
- *
- * P4 in the doc says "HMAC-SHA256 of all Stub files," which needs a key to
- * actually be an HMAC rather than a plain hash. The manifest's real
- * tamper-evidence comes from the EdDSA signature layered on top (see
- * signManifestHash/verifyManifestSignature below) -- an attacker who
- * modifies files can recompute a new manifest hash, but cannot produce a
- * valid signature over it without the facility private key. Keying the
- * HMAC itself with facility-derived material is an additional (not
- * load-bearing) layer: it also ties the manifest fingerprint to this
- * specific facility rather than being a public, comparable-across-facilities
- * plain hash.
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): the HMAC key and the EdDSA
+ * signing/verification of the manifest hash both moved to facility-key.ts
+ * (the only module that ever touches raw private-key bytes) -- this file
+ * keeps only the pure, non-secret file-walking/hashing logic. It imports
+ * the derived key, never the private key itself, and no longer calls
+ * loadConfig() at all.
  */
-async function deriveManifestHmacKey(): Promise<Buffer> {
-  const config = loadConfig();
-  const { bytes: rawPrivateKey } = await getFacilityPrivateKeyRaw();
-  try {
-    const salt = Buffer.from(config.HUUID_FACILITY_DID + HMAC_SALT_SUFFIX, 'utf8');
-    const info = Buffer.from(HMAC_INFO, 'utf8');
-    return Buffer.from(hkdfSync('sha256', rawPrivateKey, salt, info, 32));
-  } finally {
-    rawPrivateKey.fill(0);
-  }
-}
 
 function walkFiles(dir: string, extensions: string[]): string[] {
   let entries;
@@ -103,38 +79,4 @@ export async function computeManifest(): Promise<ManifestResult> {
     fileCount: relativePaths.length,
     files: relativePaths,
   };
-}
-
-/** EdDSA-signs the manifest hash with the facility private key (Step 1.3). */
-export async function signManifestHash(manifestHash: string): Promise<string> {
-  const { bytes: rawPrivateKey } = await getFacilityPrivateKeyRaw();
-  try {
-    const privateKeyObj = buildEd25519KeyObjectFromRaw(rawPrivateKey);
-    const signature = cryptoSign(null, Buffer.from(manifestHash, 'utf8'), privateKeyObj);
-    return signature.toString('base64url');
-  } finally {
-    rawPrivateKey.fill(0);
-  }
-}
-
-/**
- * Verifies against the facility's OWN public key, derived from the same
- * private key bytes this process already holds -- Ed25519 public keys are
- * always deterministically derivable from the private seed, so this needs
- * no external fetch (e.g. from huuid_facilities.public_key_multibase on the
- * resolver). This is a self-consistency check: it confirms the signature on
- * disk was produced by whichever key this process currently has access to,
- * which is exactly what "did this facility's own Stub sign this baseline"
- * needs to mean here.
- */
-export async function verifyManifestSignature(manifestHash: string, signatureB64url: string): Promise<boolean> {
-  const { bytes: rawPrivateKey } = await getFacilityPrivateKeyRaw();
-  try {
-    const privateKeyObj = buildEd25519KeyObjectFromRaw(rawPrivateKey);
-    const publicKeyObj = createPublicKey(privateKeyObj);
-    const signature = Buffer.from(signatureB64url, 'base64url');
-    return cryptoVerify(null, Buffer.from(manifestHash, 'utf8'), publicKeyObj, signature);
-  } finally {
-    rawPrivateKey.fill(0);
-  }
 }

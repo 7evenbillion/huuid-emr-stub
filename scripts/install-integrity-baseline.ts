@@ -1,8 +1,19 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { join } from 'node:path';
-import { computeManifest, signManifestHash } from '../src/integrity-manifest.js';
+import { computeManifest } from '../src/integrity-manifest.js';
+import { initFacilityKeyModule, signManifestHash } from '../src/facility-key.js';
 import { setReadOnly, clearReadOnly } from '../src/file-permissions.js';
+import { loadConfig } from '../src/config.js';
+
+// This script is its own standalone entry point/process (P5, HUUID-EMR-STUB-
+// v0.1.2.docx Section 2) -- same orchestrator role server.ts plays for the
+// running server, just for this one-shot baseline install.
+const config = loadConfig();
+initFacilityKeyModule({
+  facilityDID: config.HUUID_FACILITY_DID,
+  facilityPrivateKeyPath: config.HUUID_FACILITY_PRIVATE_KEY_PATH,
+});
 
 const BASELINE_PATH = join(process.cwd(), 'integrity', 'baseline.hmac');
 

@@ -1,7 +1,28 @@
 import type { NextFunction, Request, Response } from 'express';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { loadConfig } from './config.js';
+
+/**
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): this module receives ONLY
+ * localSecretPath -- no other secret.
+ */
+export interface LocalAuthModuleConfig {
+  localSecretPath: string;
+}
+
+let moduleConfig: LocalAuthModuleConfig | null = null;
+
+/** Called once by the orchestrator before any other export in this module is used. */
+export function initLocalAuthModule(cfg: LocalAuthModuleConfig): void {
+  moduleConfig = cfg;
+}
+
+function requireInit(): LocalAuthModuleConfig {
+  if (!moduleConfig) {
+    throw new Error('local-auth module not initialized. Call initLocalAuthModule() first.');
+  }
+  return moduleConfig;
+}
 
 const FAILURE_WINDOW_MS = 60_000; // "3 failures in 60 seconds"
 const FAILURE_THRESHOLD = 3;
@@ -52,14 +73,14 @@ let cachedSecret: string | null = null;
 
 function loadLocalSecret(): string {
   if (cachedSecret !== null) return cachedSecret;
-  const config = loadConfig();
-  if (!existsSync(config.HUUID_LOCAL_AUTH_SECRET_PATH)) {
+  const cfg = requireInit();
+  if (!existsSync(cfg.localSecretPath)) {
     throw new Error(
-      `No local-auth secret found at ${config.HUUID_LOCAL_AUTH_SECRET_PATH}. ` +
+      `No local-auth secret found at ${cfg.localSecretPath}. ` +
         `Run: npm run generate-local-secret`
     );
   }
-  cachedSecret = readFileSync(config.HUUID_LOCAL_AUTH_SECRET_PATH, 'utf8').trim();
+  cachedSecret = readFileSync(cfg.localSecretPath, 'utf8').trim();
   return cachedSecret;
 }
 
@@ -119,10 +140,10 @@ export function localAuthMiddleware(req: Request, res: Response, next: NextFunct
 }
 
 export function localAuthDiagnostics(): { secretConfigured: boolean; lockedIps: number } {
-  const config = loadConfig();
+  const cfg = requireInit();
   let secretConfigured = false;
   try {
-    secretConfigured = existsSync(config.HUUID_LOCAL_AUTH_SECRET_PATH);
+    secretConfigured = existsSync(cfg.localSecretPath);
   } catch {
     secretConfigured = false;
   }

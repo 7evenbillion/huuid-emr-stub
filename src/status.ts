@@ -1,4 +1,3 @@
-import { loadConfig } from './config.js';
 import { cacheStats, isDbFileEncrypted } from './cache.js';
 import { localAuthDiagnostics } from './local-auth.js';
 import { getKeyStorageStatus } from './facility-key.js';
@@ -7,13 +6,39 @@ import { hasBaseline, getLastCheckStatus, isIntegrityOverrideActive } from './in
 const INTEGRITY_CHECK_INTERVAL_HOURS = 6;
 
 /**
+ * P5 (HUUID-EMR-STUB-v0.1.2.docx Section 2): this module receives
+ * facilityDID, facilityCode, and resolverBaseUrl -- purely for display in
+ * the status report (GET /health, npm run diagnostics), not for any
+ * secret-touching operation. No apiKey, localSecret, or key-storage path.
+ */
+export interface StatusModuleConfig {
+  facilityDID: string;
+  facilityCode: string;
+  resolverBaseUrl: string;
+}
+
+let moduleConfig: StatusModuleConfig | null = null;
+
+/** Called once by the orchestrator before getSystemStatus() is used. */
+export function initStatusModule(cfg: StatusModuleConfig): void {
+  moduleConfig = cfg;
+}
+
+function requireInit(): StatusModuleConfig {
+  if (!moduleConfig) {
+    throw new Error('status module not initialized. Call initStatusModule() first.');
+  }
+  return moduleConfig;
+}
+
+/**
  * Local-only status (no network calls) -- used by GET /health and
  * npm run diagnostics. Deliberately honest about what v0.1.2 hardening this
  * build has NOT implemented yet, rather than echoing the doc's
  * fully-hardened installer output verbatim.
  */
 export async function getSystemStatus() {
-  const config = loadConfig();
+  const cfg = requireInit();
   const auth = localAuthDiagnostics();
   const cache = await cacheStats();
   const keyStorage = await getKeyStorageStatus();
@@ -40,11 +65,11 @@ export async function getSystemStatus() {
       lockedIps: auth.lockedIps,
     },
     facility: {
-      did: config.HUUID_FACILITY_DID,
-      code: config.HUUID_FACILITY_CODE,
+      did: cfg.facilityDID,
+      code: cfg.facilityCode,
     },
     resolver: {
-      baseUrl: config.HUUID_RESOLVER_BASE_URL,
+      baseUrl: cfg.resolverBaseUrl,
     },
   };
 }
