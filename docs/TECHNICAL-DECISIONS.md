@@ -456,3 +456,136 @@ direct `process.env` read in one of the nine library
 modules, or the clearing loop itself regresses, this
 reports `INACTIVE` and lists the leaked keys, rather than
 printing a fixed string regardless of actual state.
+
+---
+
+## 14. QR token wire format, fixed against the real resolver signer (Phase 2A cross-repo compatibility fix)
+
+**Context.** §12 noted "nothing in either repo issues a real
+QR card yet -- verification only," with `qr-verifier.ts`'s
+wire-format assumptions never cross-checked against an
+actual resolver-side signer. That changed this session:
+huuid-resolver's `lib/qr-token.ts` (Phase 2A, "emergency
+medical profile") now builds and signs real offline tokens
+at enrollment, and `/enroll/card`'s printed QR now encodes
+one. Running a real signed token from that code through this
+Stub's `verifyQRToken()` surfaced three real mismatches, all
+now fixed in `qr-verifier.ts`. This section documents the
+correct wire format going forward; treat huuid-resolver's
+`lib/qr-token.ts` as the source of truth if the two ever
+drift again -- this Stub is the consumer, not the spec owner.
+
+**Mismatch 1 -- compression.** The resolver
+`zlib.deflateRawSync()`-compresses the signed JSON object
+before base64url-encoding it (keeps the printed QR small).
+The old `verifyQRToken()` base64url-decoded straight to a
+JSON string with no inflate step -- every real token failed
+at `JSON.parse` with "Malformed QR token." Fixed: decode
+base64url -> `zlib.inflateRawSync()` -> `JSON.parse`.
+
+**Mismatch 2 -- signing target.** The resolver signs
+`SHA-256(canonical_json(payload))` (same hash-before-sign
+convention as `lib/bg-request-signature.ts`'s Break-Glass
+verification). The old `verifyQRToken()` verified the
+EdDSA signature against the raw canonical JSON string
+directly, with no SHA-256 step -- this made every signature
+fail regardless of the compression fix. This is the one that
+would have been hardest to catch by inspection alone (both
+sides "looked" like they used the same
+`canonicalJsonStringify`, and in isolation each function's
+own logic was internally consistent); it only surfaced by
+actually running a real signed token through the verifier.
+Fixed: hash `signTarget` with SHA-256 before calling
+`crypto.verify`.
+
+**Mismatch 3 -- payload shape.** The old schema had `ca:
+string[]` (bare allergy names) and no fields at all for
+medications, chronic conditions, organ donor, implanted
+devices, pregnancy status, primary facility, or contra-
+indications. The real payload's `ca` is an array of `{s, r?,
+sv?}` objects, and six more top-level fields exist that
+`qrTokenSchema` didn't recognize. Zod's default parsing mode
+silently drops unrecognized keys rather than erroring, so
+this wouldn't have thrown -- it would have silently discarded
+every one of these fields, including `nd` (do-not-give /
+severity `'never'` contraindications), the single most
+safety-critical field on the card. Fixed: schema now
+recognizes all real fields; `QRVerificationResult` exposes
+`allergies`/`medications`/`chronicConditions`/`organDonor`/
+`implantedDevices`/`pregnancyStatus`/`primaryFacilityName`/
+`doNotGive`, while `criticalAllergies: string[]` is kept
+(derived as `ca[].s`) so `cache.ts`, `server.ts`, and
+`/debug/resolver`'s HTML table don't need any changes.
+
+**Why no `.default()` on the new optional schema fields.**
+`z.array(...).default([])` would inject a key (e.g. `cc: []`)
+into `parsed.data` for a field the resolver never included in
+what it actually signed, and `fieldsToVerify` is built by
+destructuring `sig` off the *parsed* token -- so a `.default()`
+would make the re-signed canonical JSON diverge from the
+original signed bytes and every token with an omitted field
+would fail verification. `.optional()` alone preserves
+"absent stays absent" through the parse.
+
+**The full token format (huuid-resolver `lib/qr-token.ts`,
+verified against by this Stub's `qr-verifier.ts`):**
+
+```
+QR string := base64url( deflateRaw( JSON.stringify({
+  v:      1,                                  // token version
+  huuid:  "did:huuid:<cc>:<id>",
+  bt?:    "O-",                               // blood type, omitted if unset/'unknown'
+  ca?:    [{ s: "Penicillin", r?: "...", sv?: "..." }],  // allergies
+  cm?:    [{ n: "Metformin", d?: "500mg", f?: "..." }],  // medications
+  cc?:    ["Diabetes (Type 2)", ...],         // chronic conditions
+  od?:    "yes" | "no" | "unknown",           // organ donor
+  id?:    ["Pacemaker", ...],                 // implanted devices
+  preg?:  "pregnant" | "not_pregnant" | "unknown",
+  pf?:    "Korle Bu Teaching Hospital",       // primary facility name
+  nd?:    [{ s: "Aspirin", r?: "G6PD deficiency" }],  // DO NOT GIVE -- severity:'never' only
+  exp:    1942883961,                         // epoch seconds
+  iss:    "huuid-self-enrolled-v1",
+  sig:    "<base64url EdDSA signature>",
+}) ) )
+```
+
+`sig` = `base64url( Ed25519_sign( resolver_private_key, SHA256(canonical_json(payload_without_sig)) ) )`,
+where `canonical_json` recursively sorts object keys
+(`canonicalJsonStringify`, duplicated byte-for-byte in both
+repos -- see the function of the same name in this file and
+in huuid-resolver's `lib/canonical-json.ts`). Every field
+except `v`, `huuid`, `exp`, `iss`, `sig` is omitted entirely
+(not `null`) when the patient hasn't provided that data.
+
+**Verified this session:** a real token built and signed by
+`lib/qr-token.ts` (blood type, 2 allergies including a
+life-threatening one, 1 medication, 2 chronic conditions,
+organ donor, 1 implanted device, primary facility, 2
+contraindications including one `'never'`), run through the
+fixed `verifyQRToken()` with the live production resolver's
+actual published public key (`GET /1.0/resolver-public-key`,
+downloaded fresh, not reused from an old cache): decodes,
+signature verifies, all fields decode correctly including
+`doNotGive: [{ substance: "Aspirin", reason: "G6PD
+deficiency" }]`. A tampered token (corrupted trailing bytes)
+is correctly rejected with no health data returned. `npm run
+typecheck` passes with no changes needed in `server.ts`,
+`cache.ts`, or `qr-verification-log.ts`.
+
+**Still true, unchanged by this fix (see §12's honesty
+note):** the signer is still `HUUID_TEST_FACILITY_JWK`, the
+same interim key `GET /1.0/resolver-public-key` has always
+published -- huuid-resolver's own
+`docs/HANDOFF.md` §18.11 and `docs/TECHNICAL-DECISIONS.md`
+call this **Pre-Pilot Blocker 2, still open**. §12's specific
+claim that "nothing in either repo issues a real QR card yet"
+is now **stale** -- huuid-resolver's `/enroll/card` does, as
+of Phase 2A -- but its underlying warning (no real signer/
+verifier key separation exists) is unchanged and still
+correct. Do not treat a card issued today as carrying a
+production-trustworthy signature.
+
+**Do not reintroduce `.default()` on the schema's optional
+fields, and do not remove the SHA-256 hash step from
+`verifyQRToken()` -- both were the actual root causes here,
+not stylistic choices.**

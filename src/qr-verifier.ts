@@ -1,23 +1,84 @@
-import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { createPublicKey, createHash, verify as cryptoVerify } from 'node:crypto';
+import { inflateRawSync } from 'node:zlib';
 import { z } from 'zod';
+
+export interface QRAllergy {
+  substance: string;
+  reaction: string | null;
+  severity: string | null;
+}
+
+export interface QRMedication {
+  name: string;
+  dose: string | null;
+  frequency: string | null;
+}
+
+export interface QRContraindication {
+  substance: string;
+  reason: string | null;
+}
 
 export interface QRVerificationResult {
   valid: boolean;
   expired: boolean;
   huuid: string | null;
   bloodType: string | null;
+  /** Backward-compatible: allergy substance names only (ca[].s). Existing
+   * callers (cache.ts, server.ts, /debug/resolver) read this field; kept so
+   * this format change doesn't ripple into their SQLite schema. */
   criticalAllergies: string[];
+  allergies: QRAllergy[];
+  medications: QRMedication[];
+  chronicConditions: string[];
+  organDonor: string | null;
+  implantedDevices: string[];
+  pregnancyStatus: string | null;
+  primaryFacilityName: string | null;
+  /** Contraindications with severity 'never' -- the single most
+   * safety-critical field on the card. Must never be silently dropped. */
+  doNotGive: QRContraindication[];
   expiresAt: Date | null;
   error: string | null;
 }
 
 const SUPPORTED_VERSION = 1;
 
+// Mirrors huuid-resolver's lib/qr-token.ts payload shape exactly (Phase 2A,
+// see docs/TECHNICAL-DECISIONS.md). No .default() on any optional field --
+// a default would inject a key/value (e.g. cc: []) into the re-signed
+// canonical JSON that was never present in what the resolver actually
+// signed, breaking verification for every token that omits that field.
+// .optional() alone preserves "absent stays absent".
+const allergySchema = z.object({
+  s: z.string().min(1),
+  r: z.string().optional(),
+  sv: z.string().optional(),
+});
+
+const medicationSchema = z.object({
+  n: z.string().min(1),
+  d: z.string().optional(),
+  f: z.string().optional(),
+});
+
+const contraindicationSchema = z.object({
+  s: z.string().min(1),
+  r: z.string().optional(),
+});
+
 const qrTokenSchema = z.object({
   v: z.number(),
   huuid: z.string().min(1),
-  bt: z.string().nullable().optional(),
-  ca: z.array(z.string()).default([]),
+  bt: z.string().optional(),
+  ca: z.array(allergySchema).optional(),
+  cm: z.array(medicationSchema).optional(),
+  cc: z.array(z.string()).optional(),
+  od: z.string().optional(),
+  id: z.array(z.string()).optional(),
+  preg: z.string().optional(),
+  pf: z.string().optional(),
+  nd: z.array(contraindicationSchema).optional(),
   exp: z.number().finite(),
   iss: z.string().min(1),
   sig: z.string().min(1),
@@ -32,6 +93,14 @@ function emptyResult(error: string): QRVerificationResult {
     huuid: null,
     bloodType: null,
     criticalAllergies: [],
+    allergies: [],
+    medications: [],
+    chronicConditions: [],
+    organDonor: null,
+    implantedDevices: [],
+    pregnancyStatus: null,
+    primaryFacilityName: null,
+    doNotGive: [],
     expiresAt: null,
     error,
   };
@@ -77,10 +146,15 @@ function buildEd25519PublicKeyObject(rawBytes: Uint8Array) {
 }
 
 /**
- * Resolution tier 4 (offline QR card fallback), Month 4. Fully offline --
- * no network calls, no cache access, no filesystem access. Receives ONLY
- * the resolver's public key bytes, never a file path or any other secret --
- * least privilege, same principle as every other module in this Stub.
+ * Resolution tier 4 (offline QR card fallback), Month 4; wire format fixed
+ * to match the real resolver-side signer in Phase 2A (huuid-resolver's
+ * lib/qr-token.ts, first built and deployed this phase -- no resolver
+ * token issuer existed when this function was originally written, so its
+ * wire-format assumptions were never cross-checked against a real signer
+ * until now). Fully offline -- no network calls, no cache access, no
+ * filesystem access. Receives ONLY the resolver's public key bytes, never
+ * a file path or any other secret -- least privilege, same principle as
+ * every other module in this Stub.
  *
  * Only one resolver key is ever loaded in this build (see server.ts Step
  * 6), so the token's `iss` field is included in the signed payload but not
@@ -92,7 +166,11 @@ function buildEd25519PublicKeyObject(rawBytes: Uint8Array) {
 export function verifyQRToken(payload: string, resolverPublicKeyBytes: Uint8Array): QRVerificationResult {
   let decoded: string;
   try {
-    decoded = Buffer.from(payload, 'base64url').toString('utf8');
+    // Resolver deflate-compresses (zlib deflateRawSync) the signed JSON
+    // object before base64url-encoding it, to keep the printed QR small --
+    // must inflate before parsing. See docs/TECHNICAL-DECISIONS.md.
+    const compressed = Buffer.from(payload, 'base64url');
+    decoded = inflateRawSync(compressed).toString('utf8');
   } catch {
     return emptyResult('Malformed QR token.');
   }
@@ -122,12 +200,18 @@ export function verifyQRToken(payload: string, resolverPublicKeyBytes: Uint8Arra
 
   const { sig, ...fieldsToVerify } = token;
   const signTarget = canonicalJsonStringify(fieldsToVerify);
+  // Resolver signs SHA-256(canonical_json), not the raw canonical JSON
+  // bytes -- same hash-before-sign convention as lib/bg-request-
+  // signature.ts's Break-Glass verification. This was the actual bug that
+  // made every token fail signature verification before this fix: this
+  // function used to verify over the raw string directly.
+  const signTargetHash = createHash('sha256').update(signTarget, 'utf8').digest();
 
   let signatureValid: boolean;
   try {
     const publicKeyObj = buildEd25519PublicKeyObject(resolverPublicKeyBytes);
     const signature = Buffer.from(sig, 'base64url');
-    signatureValid = cryptoVerify(null, Buffer.from(signTarget, 'utf8'), publicKeyObj, signature);
+    signatureValid = cryptoVerify(null, signTargetHash, publicKeyObj, signature);
   } catch {
     signatureValid = false;
   }
@@ -144,7 +228,15 @@ export function verifyQRToken(payload: string, resolverPublicKeyBytes: Uint8Arra
     expired,
     huuid: token.huuid,
     bloodType: token.bt ?? null,
-    criticalAllergies: token.ca,
+    criticalAllergies: (token.ca ?? []).map((a) => a.s),
+    allergies: (token.ca ?? []).map((a) => ({ substance: a.s, reaction: a.r ?? null, severity: a.sv ?? null })),
+    medications: (token.cm ?? []).map((m) => ({ name: m.n, dose: m.d ?? null, frequency: m.f ?? null })),
+    chronicConditions: token.cc ?? [],
+    organDonor: token.od ?? null,
+    implantedDevices: token.id ?? [],
+    pregnancyStatus: token.preg ?? null,
+    primaryFacilityName: token.pf ?? null,
+    doNotGive: (token.nd ?? []).map((c) => ({ substance: c.s, reason: c.r ?? null })),
     expiresAt: new Date(token.exp * 1000),
     error: null,
   };
