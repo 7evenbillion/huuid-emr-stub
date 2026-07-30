@@ -184,7 +184,9 @@ app.post('/qr/verify', localAuthMiddleware, async (req: Request, res: Response) 
       huuid: null,
       bloodType: null,
       criticalAllergies: [],
+      doNotGive: [],
       expiresAt: null,
+      generatedAt: null,
       source: 'qr_card',
       error: 'QR verification unavailable: no resolver public key cached. Run npm run download-keys.',
     });
@@ -203,7 +205,9 @@ app.post('/qr/verify', localAuthMiddleware, async (req: Request, res: Response) 
       huuid: null,
       bloodType: null,
       criticalAllergies: [],
+      doNotGive: [],
       expiresAt: null,
+      generatedAt: null,
       source: 'qr_card',
       error: result.error,
     });
@@ -223,15 +227,30 @@ app.post('/qr/verify', localAuthMiddleware, async (req: Request, res: Response) 
     expiresAtSeconds: result.expiresAt ? Math.floor(result.expiresAt.getTime() / 1000) : Math.floor(Date.now() / 1000),
   });
 
+  // doNotGive/allergies/medications/etc. were added to verifyQRToken's
+  // return shape when qr-verifier.ts was fixed to match the real resolver
+  // signer, but this response was never updated to actually surface them --
+  // an extra gap found while touching this block for the warning-text
+  // change, fixed here rather than left silently incomplete. The SQLite
+  // cache schema (cache.ts's QRCacheEntry) still only stores
+  // bloodType/criticalAllergies; extending that is a real follow-up, not
+  // done here.
   res.status(200).json({
     valid: true,
     expired: result.expired,
-    warning: result.expired
-      ? 'Token expired. Data shown for emergency reference only. Verify with resolver when connectivity restored.'
-      : null,
+    warning: result.warning,
     huuid: result.huuid,
     bloodType: result.bloodType,
     criticalAllergies: result.criticalAllergies,
+    allergies: result.allergies,
+    medications: result.medications,
+    chronicConditions: result.chronicConditions,
+    organDonor: result.organDonor,
+    implantedDevices: result.implantedDevices,
+    pregnancyStatus: result.pregnancyStatus,
+    primaryFacilityName: result.primaryFacilityName,
+    doNotGive: result.doNotGive,
+    generatedAt: result.generatedAt ? result.generatedAt.toISOString() : null,
     expiresAt: result.expiresAt ? result.expiresAt.toISOString() : null,
     source: 'qr_card',
   });

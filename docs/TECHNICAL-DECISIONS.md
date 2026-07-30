@@ -589,3 +589,71 @@ production-trustworthy signature.
 fields, and do not remove the SHA-256 hash step from
 `verifyQRToken()` -- both were the actual root causes here,
 not stylistic choices.**
+
+---
+
+## 15. Token freshness: `gen`, `generatedAt`, and the expiry `warning`
+
+**Context.** huuid-resolver added a medical-profile-update
+notification feature (its own `docs/HANDOFF.md` §18.14) and
+changed the QR token TTL from an undocumented 5-year default
+to an explicit 90 days, adding a `gen` (generated-at, epoch
+seconds) field to every token alongside `exp`.
+
+**Decision.** `qrTokenSchema` gained `gen: z.number().optional()`
+-- optional, not `.default()`, for the same reason as every
+other optional field here (§14): a default would inject a key
+into the re-signed canonical JSON that a token signed before
+`gen` existed never had, breaking its signature verification.
+`QRVerificationResult` gained two fields: `generatedAt: Date |
+null` (parsed from `gen` when present) and `warning: string |
+null`.
+
+**`warning` is set to exactly `"Token expired. Medical data
+may be outdated. Verify via resolver when connectivity
+available."` when, and only when, `expired === true`; `null`
+otherwise.** `valid` was already `true` on an expired-but-
+correctly-signed token before this change -- identity
+verification has never been gated on expiry in this function,
+only the medical-data trust level changes. This decision just
+gives that state a concrete, machine-readable explanation
+instead of a bare `expired: true` a caller might not surface
+to anyone. Net effect, stated the way the operator specified
+it: identity verification always works; medical data has a
+freshness signal; the clinician knows if data is stale; the
+patient (via huuid-resolver's SMS) is prompted to refresh.
+
+**Extra gap found and fixed while touching `server.ts`'s
+`POST /qr/verify` handler for the warning-text swap, not
+requested by this task specifically.** That endpoint's `200`
+response only ever returned `bloodType`/`criticalAllergies` --
+`doNotGive`, `allergies`, `medications`, `chronicConditions`,
+`organDonor`, `implantedDevices`, and `primaryFacilityName`
+have been present on `verifyQRToken()`'s return value since
+§14's fix, but nothing wired them into the actual HTTP
+response a clinician's system calls. DO NOT GIVE -- the single
+most safety-critical field this whole file exists to surface
+-- was computed correctly and then silently dropped on the
+floor before it ever left the process. Fixed by adding the
+full field set to all three response branches (`503` no-key,
+`400` invalid, `200` valid). **Not fixed, a real follow-up**:
+`cache.ts`'s `QRCacheEntry`/SQLite schema still only persists
+`bloodType`/`criticalAllergies` -- extending the local DB
+schema is a larger, separate change, not attempted here.
+
+**Verified:** two real tokens built via huuid-resolver's actual
+`buildQrTokenPayload`/`signQrToken` (not hand-edited payloads)
+-- one with the default 90-day TTL, one with `ttlSeconds:
+-3600` to produce a token already expired at signing time --
+decoded through this fixed `verifyQRToken()` against the live
+production resolver's public key. Fresh: `valid: true, expired:
+false, warning: null, generatedAt` populated. Expired: `valid:
+true, expired: true, warning: "Token expired. Medical data may
+be outdated. Verify via resolver when connectivity available."`,
+exact match, `generatedAt` still populated correctly. `npm run
+typecheck` passes clean.
+
+**Do not gate `valid` on `expired` in any future change here --
+that was true before this task and stays true after it. An
+expired token is still a genuine, unforged identity; only the
+medical payload's freshness is in question.**

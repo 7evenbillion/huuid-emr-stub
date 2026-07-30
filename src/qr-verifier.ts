@@ -38,9 +38,19 @@ export interface QRVerificationResult {
   /** Contraindications with severity 'never' -- the single most
    * safety-critical field on the card. Must never be silently dropped. */
   doNotGive: QRContraindication[];
+  /** When this specific token was generated (resolver's `gen` field) --
+   * absent on tokens signed before that field existed. */
+  generatedAt: Date | null;
   expiresAt: Date | null;
+  /** Set only when valid && expired: identity still resolves (valid stays
+   * true), but the medical data carried in this token may be stale. Null
+   * whenever the token is not expired -- callers must not infer staleness
+   * from expiresAt alone, only from this field being non-null. */
+  warning: string | null;
   error: string | null;
 }
+
+const EXPIRED_WARNING = 'Token expired. Medical data may be outdated. Verify via resolver when connectivity available.';
 
 const SUPPORTED_VERSION = 1;
 
@@ -79,6 +89,11 @@ const qrTokenSchema = z.object({
   preg: z.string().optional(),
   pf: z.string().optional(),
   nd: z.array(contraindicationSchema).optional(),
+  /** Added alongside the medical-profile-update notification feature.
+   * Optional (not `.default()`, per this file's own established rule) so a
+   * token signed before this field existed still verifies -- the resolver
+   * always sends it now, but a verifier must not require it. */
+  gen: z.number().optional(),
   exp: z.number().finite(),
   iss: z.string().min(1),
   sig: z.string().min(1),
@@ -101,7 +116,9 @@ function emptyResult(error: string): QRVerificationResult {
     pregnancyStatus: null,
     primaryFacilityName: null,
     doNotGive: [],
+    generatedAt: null,
     expiresAt: null,
+    warning: null,
     error,
   };
 }
@@ -224,6 +241,8 @@ export function verifyQRToken(payload: string, resolverPublicKeyBytes: Uint8Arra
   }
 
   return {
+    // Identity verification always succeeds on a validly-signed token,
+    // expired or not -- only the medical-data freshness signal changes.
     valid: true,
     expired,
     huuid: token.huuid,
@@ -237,7 +256,9 @@ export function verifyQRToken(payload: string, resolverPublicKeyBytes: Uint8Arra
     pregnancyStatus: token.preg ?? null,
     primaryFacilityName: token.pf ?? null,
     doNotGive: (token.nd ?? []).map((c) => ({ substance: c.s, reason: c.r ?? null })),
+    generatedAt: token.gen ? new Date(token.gen * 1000) : null,
     expiresAt: new Date(token.exp * 1000),
+    warning: expired ? EXPIRED_WARNING : null,
     error: null,
   };
 }
